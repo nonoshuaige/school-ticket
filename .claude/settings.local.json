@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(Test-Path *)",
+      "PowerShell($git = \"D:\\\\JavaDevelop\\\\PortableGit\\\\bin\\\\git.exe\"; Set-Location D:\\\\MyProjrct; & $git status)",
+      "PowerShell($git = \"D:\\\\JavaDevelop\\\\PortableGit\\\\bin\\\\git.exe\"; Set-Location D:\\\\MyProjrct; & $git init)",
+      "PowerShell($git = \"D:\\\\JavaDevelop\\\\PortableGit\\\\bin\\\\git.exe\"; Set-Location D:\\\\MyProjrct; & $git config user.name; & $git config user.email)",
+      "PowerShell($git = \"D:\\\\JavaDevelop\\\\PortableGit\\\\bin\\\\git.exe\"; Set-Location D:\\\\MyProjrct; & $git add .; & $git status)"
+    ]
+  }
+}
