@@ -2,14 +2,14 @@
   <div class="orders-page">
     <van-nav-bar title="我的订单" left-arrow @click-left="$router.back()" />
 
-    <van-tabs v-model:active="activeTab" sticky>
+    <van-tabs v-model:active="activeTab" sticky @change="onTabChange">
       <van-tab title="全部"></van-tab>
       <van-tab title="待支付"></van-tab>
       <van-tab title="已支付"></van-tab>
     </van-tabs>
 
     <div class="order-list">
-      <div v-for="item in pagedOrders" :key="item.orderNo" class="ticket-item" @click="goToDetail(item)">
+      <div v-for="item in orders" :key="item.orderNo" class="ticket-item" @click="goToDetail(item)">
         <div class="ticket-top">
           <span class="ticket-event">{{ item.eventTitle }}</span>
           <span class="ticket-status" :style="{ color: orderStatusColor(item.status) }">
@@ -27,7 +27,7 @@
         </div>
       </div>
 
-      <div v-if="pagedOrders.length === 0 && !loading" class="empty-state">
+      <div v-if="orders.length === 0 && !loading" class="empty-state">
         <van-icon name="info-o" size="48" color="#ccc"/>
         <p>暂无订单</p>
       </div>
@@ -35,10 +35,11 @@
 
     <van-pagination
       v-if="totalPages > 1"
-      v-model="currentPage"
+      v-model="page"
       :page-count="totalPages"
       :items-per-page="pageSize"
       mode="simple"
+      @change="onPageChange"
     />
   </div>
 </template>
@@ -52,40 +53,41 @@ import { formatDate, orderStatusText, orderStatusColor } from '../utils/format'
 
 const router = useRouter()
 const orders = ref([])
+const total = ref(0)
 const loading = ref(false)
 const activeTab = ref(0)
-const currentPage = ref(1)
+const page = ref(1)
 const pageSize = 10
 
-const filteredOrders = computed(() => {
-  if (activeTab.value === 0) return orders.value
-  if (activeTab.value === 1) return orders.value.filter(o => o.status === 0)
-  if (activeTab.value === 2) return orders.value.filter(o => o.status === 1)
-  return orders.value
-})
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
 
-const totalPages = computed(() => {
-  return Math.max(1, Math.ceil(filteredOrders.value.length / pageSize))
-})
+function buildParams() {
+  const params = { page: page.value, pageSize }
+  if (activeTab.value === 1) params.status = 0
+  else if (activeTab.value === 2) params.status = 1
+  return params
+}
 
-const pagedOrders = computed(() => {
-  const start = (currentPage.value - 1) * pageSize
-  const end = start + pageSize
-  return filteredOrders.value.slice(start, end)
-})
-
-onMounted(async () => {
-  await loadOrders()
-})
+onMounted(() => { loadOrders() })
 
 async function loadOrders() {
   loading.value = true
   try {
-    orders.value = await getOrderList()
-    currentPage.value = 1
+    const res = await getOrderList(buildParams())
+    orders.value = res.records
+    total.value = res.total
   } catch {} finally {
     loading.value = false
   }
+}
+
+function onTabChange() {
+  page.value = 1
+  loadOrders()
+}
+
+function onPageChange() {
+  loadOrders()
 }
 
 function statusLabel(item) {

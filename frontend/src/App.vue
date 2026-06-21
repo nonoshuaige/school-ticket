@@ -16,7 +16,7 @@ const route = useRoute()
 const userStore = useUserStore()
 
 const showTabbar = computed(() => {
-  return ['/', '/mine'].includes(route.path)
+  return ['/', '/notes', '/mine'].includes(route.path)
 })
 
 onMounted(async () => {

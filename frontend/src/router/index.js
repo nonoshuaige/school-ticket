@@ -4,6 +4,7 @@ const routes = [
   { path: '/login', name: 'Login', component: () => import('../views/Login.vue') },
   { path: '/register', name: 'Register', component: () => import('../views/Register.vue') },
 
+  { path: '/notes', name: 'Notes', component: () => import('../views/Notes.vue') },
   { path: '/', name: 'EventList', component: () => import('../views/EventList.vue') },
   { path: '/event/:id', name: 'EventDetail', component: () => import('../views/EventDetail.vue') },
 

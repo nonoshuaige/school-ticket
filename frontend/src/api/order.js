@@ -16,8 +16,8 @@ export function refundOrder(orderNo) {
   return request.post('/order/refund', { orderNo })
 }
 
-export function getOrderList() {
-  return request.get('/order/list')
+export function getOrderList(params) {
+  return request.get('/order/list', { params })
 }
 
 export function getOrderDetail(orderNo) {

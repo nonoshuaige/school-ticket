@@ -15,8 +15,10 @@ public class EventController {
     private final EventService eventService;
 
     @GetMapping("/list")
-    public Result<?> list(@RequestParam(required = false) Integer status) {
-        return Result.success(eventService.getEventList(status));
+    public Result<?> list(@RequestParam(required = false) Integer status,
+                          @RequestParam(defaultValue = "1") Integer page,
+                          @RequestParam(defaultValue = "8") Integer pageSize) {
+        return Result.success(eventService.getEventList(status, page, pageSize));
     }
 
     @GetMapping("/{eventId}")

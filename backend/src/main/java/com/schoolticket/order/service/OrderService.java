@@ -2,6 +2,8 @@ package com.schoolticket.order.service;
 
 import cn.hutool.core.util.IdUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.metadata.IPage;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.schoolticket.common.BusinessException;
 import com.schoolticket.dto.OrderCreateReq;
 import com.schoolticket.dto.OrderVO;
@@ -18,8 +20,6 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
-import java.util.List;
-import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -132,12 +132,15 @@ public class OrderService {
 
     // ===================== 查询 =====================
 
-    public List<OrderVO> listOrders(Long userId) {
-        List<Order> orders = orderMapper.selectList(
-                new LambdaQueryWrapper<Order>()
-                        .eq(Order::getUserId, userId)
-                        .orderByDesc(Order::getCreateTime));
-        return orders.stream().map(this::convertToVO).collect(Collectors.toList());
+    public IPage<OrderVO> listOrders(Long userId, Integer pageNum, Integer pageSize, Integer status) {
+        Page<Order> page = new Page<>(pageNum, pageSize);
+        LambdaQueryWrapper<Order> wrapper = new LambdaQueryWrapper<Order>()
+                .eq(Order::getUserId, userId);
+        if (status != null) {
+            wrapper.eq(Order::getStatus, status);
+        }
+        wrapper.orderByDesc(Order::getCreateTime);
+        return orderMapper.selectPage(page, wrapper).convert(this::convertToVO);
     }
 
     public OrderVO getOrderDetail(String orderNo) {

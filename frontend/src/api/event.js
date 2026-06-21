@@ -1,7 +1,7 @@
 import request from '../utils/request'
 
-export function getEventList(status) {
-  return request.get('/event/list', { params: { status } })
+export function getEventList(status, page = 1, pageSize = 8) {
+  return request.get('/event/list', { params: { status, page, pageSize } })
 }
 
 export function getEventDetail(eventId) {

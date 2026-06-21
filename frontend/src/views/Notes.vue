@@ -1,0 +1,261 @@
+<template>
+  <div class="notes-page">
+    <van-nav-bar title="笔记" fixed placeholder />
+    <van-pull-refresh v-model="refreshing" @refresh="onRefresh">
+      <div class="note-grid">
+        <div v-for="item in notes" :key="item.noteId" class="note-card">
+          <div class="note-cover" :style="{ background: coverGradient(item.noteId) }">
+            <span class="cover-emoji">{{ coverEmoji(item.noteId) }}</span>
+          </div>
+          <div class="note-body">
+            <div class="note-content">{{ item.content }}</div>
+            <div class="note-meta">
+              <div class="note-author">
+                <div class="author-avatar">{{ (item.nickname || 'U')[0] }}</div>
+                <span class="author-name">{{ item.nickname }}</span>
+              </div>
+              <div class="like-btn" :class="{ liked: item.isLiked }" @click.stop="toggleLike(item)">
+                <van-icon :name="item.isLiked ? 'like' : 'like-o'" size="16" />
+                <span>{{ item.likeCount || 0 }}</span>
+              </div>
+            </div>
+            <div class="note-footer">
+              <span class="note-time">{{ formatTime(item.createTime) }}</span>
+              <van-button
+                v-if="item.userId !== userStore.userInfo?.userId"
+                size="mini"
+                :type="item.isFollowing ? 'default' : 'primary'"
+                :plain="item.isFollowing"
+                round
+                @click.stop="toggleFollow(item)"
+                style="font-size:10px;min-width:44px;height:22px"
+              >{{ item.isFollowing ? '已关注' : '+ 关注' }}</van-button>
+            </div>
+          </div>
+        </div>
+
+        <div v-if="notes.length === 0 && !loading" class="empty-state">
+          <van-icon name="notes-o" size="48" color="#ccc"/>
+          <p>暂无笔记</p>
+        </div>
+      </div>
+    </van-pull-refresh>
+
+    <div v-if="loading" class="loading-state">
+      <van-loading size="24" />
+    </div>
+
+    <div v-if="!loading && totalPages > 1" class="pagination-wrap">
+      <van-pagination
+        v-model="page"
+        :page-count="totalPages"
+        :items-per-page="pageSize"
+        mode="simple"
+        @change="onPageChange"
+      />
+    </div>
+
+    <BottomNav />
+  </div>
+</template>
+
+<script setup>
+import { ref, computed, onMounted } from 'vue'
+import { showToast } from 'vant'
+import { getNoteList, likeNote, unlikeNote } from '../api/note'
+import { followUser, unfollowUser } from '../api/user'
+import { useUserStore } from '../stores/user'
+import BottomNav from '../components/BottomNav.vue'
+
+const userStore = useUserStore()
+const notes = ref([])
+const total = ref(0)
+const loading = ref(false)
+const refreshing = ref(false)
+const page = ref(1)
+const pageSize = 10
+
+const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+
+const gradients = [
+  'linear-gradient(135deg, #667eea, #764ba2)',
+  'linear-gradient(135deg, #f093fb, #f5576c)',
+  'linear-gradient(135deg, #4facfe, #00f2fe)',
+  'linear-gradient(135deg, #43e97b, #38f9d7)',
+  'linear-gradient(135deg, #fa709a, #fee140)',
+  'linear-gradient(135deg, #a18cd1, #fbc2eb)',
+  'linear-gradient(135deg, #fccb90, #d57eeb)',
+  'linear-gradient(135deg, #ffecd2, #fcb69f)',
+]
+const emojis = ['🌸','🎵','📖','🍔','🏃','📷','🎮','✨','🌈','🎨','🍕','🎬','📝','💡','🌟','🔥']
+
+function coverGradient(id) {
+  return gradients[id % gradients.length]
+}
+function coverEmoji(id) {
+  return emojis[id % emojis.length]
+}
+
+function formatTime(dateStr) {
+  if (!dateStr) return ''
+  const d = new Date(dateStr)
+  const pad = n => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+async function loadNotes() {
+  loading.value = true
+  try {
+    const res = await getNoteList({ page: page.value, pageSize })
+    const records = res.records || []
+    if (userStore.isLoggedIn) {
+      const { checkFollowing } = await import('../api/user')
+      for (const item of records) {
+        if (item.userId === userStore.userInfo?.userId) {
+          item.isFollowing = false
+        } else {
+          try {
+            item.isFollowing = await checkFollowing(item.userId)
+          } catch { item.isFollowing = false }
+        }
+        item._loaded = true
+      }
+    } else {
+      records.forEach(r => { r.isFollowing = false; r._loaded = true })
+    }
+    notes.value = records
+    total.value = res.total
+  } catch {} finally {
+    loading.value = false
+  }
+}
+
+async function onRefresh() {
+  refreshing.value = true
+  page.value = 1
+  await loadNotes()
+  refreshing.value = false
+}
+
+function onPageChange() {
+  loadNotes()
+}
+
+async function toggleLike(item) {
+  if (!userStore.isLoggedIn) {
+    showToast('请先登录')
+    return
+  }
+  try {
+    if (item.isLiked) {
+      await unlikeNote(item.noteId)
+      item.isLiked = false
+      item.likeCount = Math.max(0, (item.likeCount || 0) - 1)
+    } else {
+      await likeNote(item.noteId)
+      item.isLiked = true
+      item.likeCount = (item.likeCount || 0) + 1
+    }
+  } catch {}
+}
+
+async function toggleFollow(item) {
+  if (!userStore.isLoggedIn) {
+    showToast('请先登录')
+    return
+  }
+  try {
+    if (item.isFollowing) {
+      await unfollowUser(item.userId)
+      item.isFollowing = false
+      showToast('已取消关注')
+    } else {
+      await followUser(item.userId)
+      item.isFollowing = true
+      showToast('关注成功')
+    }
+  } catch {}
+}
+
+onMounted(() => { loadNotes() })
+</script>
+
+<style scoped>
+.notes-page { padding-bottom: 60px; }
+.note-grid {
+  padding: 0 8px;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 8px;
+}
+.note-card {
+  background: #fff;
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: 0 1px 4px rgba(0,0,0,.04);
+}
+.note-cover {
+  height: 100px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.cover-emoji { font-size: 40px; }
+.note-body { padding: 8px 10px; }
+.note-content {
+  font-size: 12px;
+  color: #333;
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-bottom: 8px;
+  min-height: 36px;
+}
+.note-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 6px;
+}
+.note-author { display: flex; align-items: center; gap: 4px; }
+.author-avatar {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  color: #fff;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 10px;
+  font-weight: 600;
+  flex-shrink: 0;
+}
+.author-name { font-size: 11px; color: #999; max-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.note-actions { display: flex; align-items: center; gap: 10px; }
+.like-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: #bbb;
+  cursor: pointer;
+  user-select: none;
+  font-size: 12px;
+}
+.like-btn.liked { color: #ee0a24; }
+.note-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid #f5f5f5;
+  padding-top: 6px;
+}
+.note-time { font-size: 10px; color: #bbb; }
+.empty-state { text-align: center; padding: 80px 0; }
+.empty-state p { color: #999; margin-top: 8px; }
+.loading-state { text-align: center; padding: 20px; }
+.pagination-wrap { display: flex; justify-content: center; margin-top: 16px; }
+</style>

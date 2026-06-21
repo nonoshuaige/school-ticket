@@ -92,11 +92,6 @@
             <artifactId>spring-boot-starter-test</artifactId>
             <scope>test</scope>
         </dependency>
-        <dependency>
-            <groupId>com.schoolticket</groupId>
-            <artifactId>school-ticket</artifactId>
-            <version>1.0.0</version>
-        </dependency>
     </dependencies>
 
     <build>

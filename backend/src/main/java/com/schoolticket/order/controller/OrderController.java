@@ -44,9 +44,11 @@ public class OrderController {
     }
 
     @GetMapping("/list")
-    public Result<?> list() {
+    public Result<?> list(@RequestParam(defaultValue = "1") Integer page,
+                          @RequestParam(defaultValue = "10") Integer pageSize,
+                          @RequestParam(required = false) Integer status) {
         Long userId = CurrentUserHolder.getUserId();
-        return Result.success(orderService.listOrders(userId));
+        return Result.success(orderService.listOrders(userId, page, pageSize, status));
     }
 
     @GetMapping("/{orderNo}")
