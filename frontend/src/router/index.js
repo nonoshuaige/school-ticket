@@ -5,6 +5,7 @@ const routes = [
   { path: '/register', name: 'Register', component: () => import('../views/Register.vue') },
 
   { path: '/notes', name: 'Notes', component: () => import('../views/Notes.vue') },
+  { path: '/note/:id', name: 'NoteDetail', component: () => import('../views/NoteDetail.vue') },
   { path: '/', name: 'EventList', component: () => import('../views/EventList.vue') },
   { path: '/event/:id', name: 'EventDetail', component: () => import('../views/EventDetail.vue') },
 

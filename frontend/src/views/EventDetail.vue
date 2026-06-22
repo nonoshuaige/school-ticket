@@ -24,7 +24,10 @@
         v-for="ticket in tickets"
         :key="ticket.ticketId"
         class="ticket-card"
-        :class="{ selected: selectedTicket?.ticketId === ticket.ticketId, disabled: !isOnSale }"
+        :class="{
+          selected: selectedTicket?.ticketId === ticket.ticketId,
+          disabled: !isOnSale || getTicketStatus(ticket).disabled
+        }"
         @click="isOnSale && selectTicket(ticket)"
       >
         <div class="ticket-left">
@@ -36,11 +39,12 @@
         <div class="ticket-right">
           <div class="ticket-price">¥{{ ticket.price }}</div>
           <div v-if="!isOnSale" class="ticket-not-sale">未开售</div>
+          <div v-else-if="getTicketStatus(ticket).reason" class="ticket-not-sale">{{ getTicketStatus(ticket).reason }}</div>
           <van-stepper
-            v-if="isOnSale && selectedTicket?.ticketId === ticket.ticketId"
+            v-if="isOnSale && !getTicketStatus(ticket).disabled && selectedTicket?.ticketId === ticket.ticketId"
             v-model="quantity"
             :min="1"
-            :max="Math.min(ticket.remainingQuantity, 5)"
+            :max="Math.min(ticket.remainingQuantity, getTicketStatus(ticket).maxQty)"
             @click.stop
           />
         </div>
@@ -65,7 +69,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showToast } from 'vant'
-import { getEventDetail } from '../api/event'
+import { getEventDetail, getPurchaseStatus } from '../api/event'
 import { useOrderStore } from '../stores/order'
 import { formatDate } from '../utils/format'
 
@@ -77,6 +81,7 @@ const event = ref(null)
 const tickets = ref([])
 const selectedTicket = ref(null)
 const quantity = ref(1)
+const purchaseStatus = ref(null)
 
 const isOnSale = computed(() => {
   if (!event.value) return false
@@ -98,13 +103,40 @@ onMounted(async () => {
     const data = await getEventDetail(route.params.id)
     event.value = data.event
     tickets.value = data.tickets
+    if (localStorage.getItem('isLoggedIn')) {
+      try {
+        purchaseStatus.value = await getPurchaseStatus(route.params.id)
+      } catch { /* 未登录忽略 */ }
+    }
   } catch {
     showToast('加载失败')
     router.back()
   }
 })
 
+function getTicketStatus(ticket) {
+  if (!purchaseStatus.value) return { disabled: false, reason: '', maxQty: 5 }
+  const ps = purchaseStatus.value
+  // 已购买其他票档 → 全部不可买
+  if (ps.purchasedTicketId && ps.purchasedTicketId !== ticket.ticketId) {
+    return { disabled: true, reason: '已购买其他票档', maxQty: 0 }
+  }
+  // 该票档已买满5张
+  if (ps.purchasedTicketId === ticket.ticketId && ps.purchasedQuantity >= 5) {
+    return { disabled: true, reason: '已达购买上限', maxQty: 0 }
+  }
+  // 该票档已买部分
+  if (ps.purchasedTicketId === ticket.ticketId) {
+    const remaining = 5 - ps.purchasedQuantity
+    return { disabled: false, reason: `已购${ps.purchasedQuantity}/5张`, maxQty: remaining }
+  }
+  // 未购买
+  return { disabled: false, reason: '', maxQty: 5 }
+}
+
 function selectTicket(ticket) {
+  const status = getTicketStatus(ticket)
+  if (status.disabled) return
   if (selectedTicket.value?.ticketId === ticket.ticketId) {
     selectedTicket.value = null
   } else {

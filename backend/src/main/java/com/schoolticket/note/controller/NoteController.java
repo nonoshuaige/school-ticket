@@ -3,9 +3,12 @@ package com.schoolticket.note.controller;
 import com.schoolticket.common.BusinessException;
 import com.schoolticket.common.CurrentUserHolder;
 import com.schoolticket.common.Result;
+import com.schoolticket.note.service.NoteCommentService;
 import com.schoolticket.note.service.NoteService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
+
+import java.util.Map;
 
 @RestController
 @RequestMapping("/api/v1/note")
@@ -13,12 +16,41 @@ import org.springframework.web.bind.annotation.*;
 public class NoteController {
 
     private final NoteService noteService;
+    private final NoteCommentService noteCommentService;
 
+    /** 笔记列表 - 游标分页 */
     @GetMapping("/list")
-    public Result<?> list(@RequestParam(defaultValue = "1") Integer page,
-                          @RequestParam(defaultValue = "20") Integer pageSize) {
+    public Result<?> list(@RequestParam(required = false) Long cursor,
+                          @RequestParam(defaultValue = "20") Integer pageSize,
+                          @RequestParam(defaultValue = "latest") String sort) {
         Long userId = tryGetUserId();
-        return Result.success(noteService.listNotes(page, pageSize, userId));
+        return Result.success(noteService.listNotes(cursor, pageSize, userId, sort));
+    }
+
+    /** 冷启动：同步 MySQL → Redis */
+    @PostMapping("/sync-to-redis")
+    public Result<?> syncToRedis() {
+        noteService.syncAllToRedis();
+        return Result.success("ok");
+    }
+
+    @PostMapping("/create")
+    public Result<?> create(@RequestBody Map<String, Object> body) {
+        Long userId = requireUserId();
+        String content = (String) body.get("content");
+        if (content == null || content.trim().isEmpty()) {
+            throw new BusinessException(400, "内容不能为空");
+        }
+        if (content.length() > 500) {
+            throw new BusinessException(400, "内容不能超过500字");
+        }
+        return Result.success(noteService.createNote(userId, content.trim()));
+    }
+
+    @GetMapping("/{noteId}")
+    public Result<?> detail(@PathVariable Long noteId) {
+        Long userId = tryGetUserId();
+        return Result.success(noteService.getNoteDetail(noteId, userId));
     }
 
     @PostMapping("/{noteId}/like")
@@ -32,6 +64,36 @@ public class NoteController {
     public Result<?> unlike(@PathVariable Long noteId) {
         Long userId = requireUserId();
         noteService.unlike(noteId, userId);
+        return Result.success(null);
+    }
+
+    @PostMapping("/{noteId}/comment")
+    public Result<?> createComment(@PathVariable Long noteId, @RequestBody Map<String, Object> body) {
+        Long userId = requireUserId();
+        String content = (String) body.get("content");
+        if (content == null || content.trim().isEmpty()) {
+            throw new BusinessException(400, "评论内容不能为空");
+        }
+        if (content.length() > 500) {
+            throw new BusinessException(400, "评论内容不能超过500字");
+        }
+        Long parentId = body.get("parentId") != null ? ((Number) body.get("parentId")).longValue() : 0L;
+        Long replyToUid = body.get("replyToUid") != null ? ((Number) body.get("replyToUid")).longValue() : null;
+        noteCommentService.createComment(noteId, userId, content.trim(), parentId, replyToUid);
+        return Result.success(null);
+    }
+
+    @GetMapping("/{noteId}/comment")
+    public Result<?> listComments(@PathVariable Long noteId,
+                                  @RequestParam(defaultValue = "1") Integer page,
+                                  @RequestParam(defaultValue = "20") Integer pageSize) {
+        return Result.success(noteCommentService.listComments(noteId, page, pageSize));
+    }
+
+    @DeleteMapping("/{noteId}/comment/{commentId}")
+    public Result<?> deleteComment(@PathVariable Long noteId, @PathVariable Long commentId) {
+        Long userId = requireUserId();
+        noteCommentService.deleteComment(commentId, userId);
         return Result.success(null);
     }
 

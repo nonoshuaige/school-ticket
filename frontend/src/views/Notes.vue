@@ -1,9 +1,16 @@
 <template>
   <div class="notes-page">
     <van-nav-bar title="笔记" fixed placeholder />
+    <van-sticky offset-top="46">
+      <div class="sort-tabs">
+        <span :class="{ active: sortMode === 'hottest' }" @click="switchSort('hottest')">最热</span>
+        <span :class="{ active: sortMode === 'latest' }" @click="switchSort('latest')">最新</span>
+        <span :class="{ active: sortMode === 'mine' }" @click="switchSort('mine')">我的</span>
+      </div>
+    </van-sticky>
     <van-pull-refresh v-model="refreshing" @refresh="onRefresh">
       <div class="note-grid">
-        <div v-for="item in notes" :key="item.noteId" class="note-card">
+        <div v-for="item in notes" :key="item.noteId" class="note-card" @click="goDetail(item.noteId)">
           <div class="note-cover" :style="{ background: coverGradient(item.noteId) }">
             <span class="cover-emoji">{{ coverEmoji(item.noteId) }}</span>
           </div>
@@ -45,37 +52,60 @@
       <van-loading size="24" />
     </div>
 
-    <div v-if="!loading && totalPages > 1" class="pagination-wrap">
-      <van-pagination
-        v-model="page"
-        :page-count="totalPages"
-        :items-per-page="pageSize"
-        mode="simple"
-        @change="onPageChange"
-      />
+    <div v-if="!loading && hasMore" class="load-more-wrap">
+      <van-button round plain type="primary" size="small" :loading="loadingMore" @click="loadMore">
+        加载更多
+      </van-button>
     </div>
+
+    <div class="publish-btn" @click="showPublish = true">
+      <van-icon name="edit" size="22" color="#fff" />
+    </div>
+
+    <van-dialog
+      v-model:show="showPublish"
+      title="发布笔记"
+      show-cancel-button
+      :before-close="beforePublish"
+    >
+      <div style="padding: 16px;">
+        <van-field
+          v-model="publishContent"
+          type="textarea"
+          placeholder="分享你的想法..."
+          rows="4"
+          maxlength="500"
+          show-word-limit
+        />
+      </div>
+    </van-dialog>
 
     <BottomNav />
   </div>
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
-import { showToast } from 'vant'
-import { getNoteList, likeNote, unlikeNote } from '../api/note'
+import { ref, onMounted } from 'vue'
+import { useRouter } from 'vue-router'
+import { showToast, showSuccessToast } from 'vant'
+import { getNoteList, createNote, likeNote, unlikeNote } from '../api/note'
 import { followUser, unfollowUser } from '../api/user'
 import { useUserStore } from '../stores/user'
 import BottomNav from '../components/BottomNav.vue'
 
+const router = useRouter()
 const userStore = useUserStore()
 const notes = ref([])
 const total = ref(0)
+const showPublish = ref(false)
+const publishContent = ref('')
 const loading = ref(false)
 const refreshing = ref(false)
-const page = ref(1)
+const loadingMore = ref(false)
 const pageSize = 10
-
-const totalPages = computed(() => Math.max(1, Math.ceil(total.value / pageSize)))
+const sortMode = ref('hottest')
+const nextCursor = ref(null)
+const hasMore = ref(false)
 
 const gradients = [
   'linear-gradient(135deg, #667eea, #764ba2)',
@@ -103,10 +133,22 @@ function formatTime(dateStr) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
+function switchSort(mode) {
+  if (mode === 'mine' && !userStore.isLoggedIn) {
+    showToast('请先登录')
+    return
+  }
+  if (sortMode.value === mode) return
+  sortMode.value = mode
+  nextCursor.value = null
+  notes.value = []
+  loadNotes()
+}
+
 async function loadNotes() {
   loading.value = true
   try {
-    const res = await getNoteList({ page: page.value, pageSize })
+    const res = await getNoteList({ cursor: nextCursor.value, pageSize, sort: sortMode.value })
     const records = res.records || []
     if (userStore.isLoggedIn) {
       const { checkFollowing } = await import('../api/user')
@@ -124,21 +166,49 @@ async function loadNotes() {
       records.forEach(r => { r.isFollowing = false; r._loaded = true })
     }
     notes.value = records
-    total.value = res.total
+    total.value = res.total || 0
+    nextCursor.value = res.nextCursor || null
+    hasMore.value = res.hasMore || false
   } catch {} finally {
     loading.value = false
   }
 }
 
-async function onRefresh() {
-  refreshing.value = true
-  page.value = 1
-  await loadNotes()
-  refreshing.value = false
+async function loadMore() {
+  if (!hasMore.value || loadingMore.value) return
+  loadingMore.value = true
+  try {
+    const res = await getNoteList({ cursor: nextCursor.value, pageSize, sort: sortMode.value })
+    const records = res.records || []
+    if (userStore.isLoggedIn) {
+      const { checkFollowing } = await import('../api/user')
+      for (const item of records) {
+        if (item.userId === userStore.userInfo?.userId) {
+          item.isFollowing = false
+        } else {
+          try {
+            item.isFollowing = await checkFollowing(item.userId)
+          } catch { item.isFollowing = false }
+        }
+        item._loaded = true
+      }
+    } else {
+      records.forEach(r => { r.isFollowing = false; r._loaded = true })
+    }
+    notes.value.push(...records)
+    total.value = res.total || 0
+    nextCursor.value = res.nextCursor || null
+    hasMore.value = res.hasMore || false
+  } catch {} finally {
+    loadingMore.value = false
+  }
 }
 
-function onPageChange() {
-  loadNotes()
+async function onRefresh() {
+  refreshing.value = true
+  nextCursor.value = null
+  await loadNotes()
+  refreshing.value = false
 }
 
 async function toggleLike(item) {
@@ -157,6 +227,28 @@ async function toggleLike(item) {
       item.likeCount = (item.likeCount || 0) + 1
     }
   } catch {}
+}
+
+function goDetail(noteId) {
+  router.push(`/note/${noteId}`)
+}
+
+async function beforePublish(action) {
+  if (action === 'cancel') return true
+  if (!publishContent.value.trim()) {
+    showToast('请输入内容')
+    return false
+  }
+  try {
+    await createNote(publishContent.value.trim())
+    publishContent.value = ''
+    showSuccessToast('发布成功')
+    nextCursor.value = null
+    await loadNotes()
+    return true
+  } catch {
+    return false
+  }
 }
 
 async function toggleFollow(item) {
@@ -182,6 +274,37 @@ onMounted(() => { loadNotes() })
 
 <style scoped>
 .notes-page { padding-bottom: 60px; }
+.sort-tabs {
+  display: flex;
+  background: #fff;
+  border-bottom: 1px solid #eee;
+  padding: 0 16px;
+}
+.sort-tabs span {
+  flex: 1;
+  text-align: center;
+  padding: 12px 0;
+  font-size: 14px;
+  color: #666;
+  cursor: pointer;
+  position: relative;
+  transition: color 0.2s;
+}
+.sort-tabs span.active {
+  color: #667eea;
+  font-weight: 600;
+}
+.sort-tabs span.active::after {
+  content: '';
+  position: absolute;
+  bottom: 0;
+  left: 50%;
+  transform: translateX(-50%);
+  width: 24px;
+  height: 3px;
+  background: #667eea;
+  border-radius: 2px;
+}
 .note-grid {
   padding: 0 8px;
   display: grid;
@@ -257,5 +380,20 @@ onMounted(() => { loadNotes() })
 .empty-state { text-align: center; padding: 80px 0; }
 .empty-state p { color: #999; margin-top: 8px; }
 .loading-state { text-align: center; padding: 20px; }
-.pagination-wrap { display: flex; justify-content: center; margin-top: 16px; }
+.load-more-wrap { display: flex; justify-content: center; margin: 16px 0; }
+.publish-btn {
+  position: fixed;
+  right: 20px;
+  bottom: 100px;
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #667eea, #764ba2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+  z-index: 100;
+  cursor: pointer;
+}
 </style>

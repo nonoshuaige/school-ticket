@@ -1,5 +1,6 @@
 package com.schoolticket.event.controller;
 
+import com.schoolticket.common.CurrentUserHolder;
 import com.schoolticket.common.Result;
 import com.schoolticket.event.service.EventService;
 import lombok.RequiredArgsConstructor;
@@ -33,5 +34,11 @@ public class EventController {
     @GetMapping("/{eventId}/tickets")
     public Result<?> tickets(@PathVariable Long eventId) {
         return Result.success(eventService.getTicketsByEvent(eventId));
+    }
+
+    @GetMapping("/{eventId}/purchase-status")
+    public Result<?> purchaseStatus(@PathVariable Long eventId) {
+        Long userId = CurrentUserHolder.getUserId();
+        return Result.success(eventService.getPurchaseStatus(eventId, userId));
     }
 }

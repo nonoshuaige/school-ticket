@@ -10,7 +10,7 @@ public class UserFollow {
     @TableId(type = IdType.AUTO)
     private Long id;
     private Long followerId;
-    private Long followeeId;
+    private Long userId;
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 }

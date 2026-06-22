@@ -23,3 +23,7 @@ Thumbs.db
 # Env
 .env
 .env.local
+
+# Claude Code
+.claude/
+gen_data.sql

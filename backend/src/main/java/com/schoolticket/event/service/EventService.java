@@ -7,6 +7,8 @@ import com.schoolticket.event.entity.Event;
 import com.schoolticket.event.entity.TicketCategory;
 import com.schoolticket.event.mapper.EventMapper;
 import com.schoolticket.event.mapper.TicketCategoryMapper;
+import com.schoolticket.order.entity.Order;
+import com.schoolticket.order.mapper.OrderMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 
@@ -20,6 +22,7 @@ public class EventService {
 
     private final EventMapper eventMapper;
     private final TicketCategoryMapper ticketCategoryMapper;
+    private final OrderMapper orderMapper;
 
     public IPage<Event> getEventList(Integer status, Integer page, Integer pageSize) {
         LambdaQueryWrapper<Event> wrapper = new LambdaQueryWrapper<Event>()
@@ -65,5 +68,37 @@ public class EventService {
                 new LambdaQueryWrapper<TicketCategory>()
                         .eq(TicketCategory::getEventId, eventId)
                         .orderByAsc(TicketCategory::getPrice));
+    }
+
+    public Map<String, Object> getPurchaseStatus(Long eventId, Long userId) {
+        Map<String, Object> result = new HashMap<>();
+        result.put("purchasedTicketId", null);
+        result.put("purchasedQuantity", 0);
+        result.put("maxQuantity", 5);
+
+        if (userId == null) {
+            return result;
+        }
+
+        List<TicketCategory> allTickets = ticketCategoryMapper.selectList(
+                new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, eventId));
+        List<Long> ticketIds = allTickets.stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
+        if (ticketIds.isEmpty()) {
+            return result;
+        }
+
+        List<Order> existingOrders = orderMapper.selectList(
+                new LambdaQueryWrapper<Order>()
+                        .eq(Order::getUserId, userId)
+                        .in(Order::getTicketId, ticketIds)
+                        .notIn(Order::getStatus, 2, 3));
+
+        if (!existingOrders.isEmpty()) {
+            Long purchasedTicketId = existingOrders.get(0).getTicketId();
+            int totalQty = existingOrders.stream().mapToInt(Order::getQuantity).sum();
+            result.put("purchasedTicketId", purchasedTicketId);
+            result.put("purchasedQuantity", totalQty);
+        }
+        return result;
     }
 }

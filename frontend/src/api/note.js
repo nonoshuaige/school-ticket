@@ -1,7 +1,16 @@
 import request from '../utils/request'
 
 export function getNoteList(params) {
+  // cursor-based: { cursor, pageSize, sort }
   return request.get('/note/list', { params })
+}
+
+export function getNoteDetail(noteId) {
+  return request.get(`/note/${noteId}`)
+}
+
+export function createNote(content) {
+  return request.post('/note/create', { content })
 }
 
 export function likeNote(noteId) {
@@ -10,4 +19,16 @@ export function likeNote(noteId) {
 
 export function unlikeNote(noteId) {
   return request.delete(`/note/${noteId}/like`)
+}
+
+export function getComments(noteId, params) {
+  return request.get(`/note/${noteId}/comment`, { params })
+}
+
+export function createComment(noteId, data) {
+  return request.post(`/note/${noteId}/comment`, data)
+}
+
+export function deleteComment(noteId, commentId) {
+  return request.delete(`/note/${noteId}/comment/${commentId}`)
 }

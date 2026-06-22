@@ -5,6 +5,7 @@ import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.schoolticket.common.BusinessException;
+import com.schoolticket.dto.EventOrderGroupVO;
 import com.schoolticket.dto.OrderCreateReq;
 import com.schoolticket.dto.OrderVO;
 import com.schoolticket.event.entity.Event;
@@ -20,6 +21,11 @@ import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Service
@@ -34,7 +40,7 @@ public class OrderService {
 
     /**
      * 创建订单（名额扣减）
-     * 事务内：FOR UPDATE 锁行 → 校验余量 → 扣减 → 生成订单
+     * 每次购买独立生成订单，不合并
      */
     @Transactional
     public Order createOrder(Long userId, OrderCreateReq req) {
@@ -44,24 +50,27 @@ public class OrderService {
             throw new BusinessException(BusinessException.INVALID_PARAM, "票档不存在");
         }
 
-        // 2. 校验余量
+        // 2. 检查用户购买限制：每活动每类票最多5张，且只能买一类
+        checkPurchaseLimit(userId, ticket.getEventId(), req.getTicketId(), req.getQuantity());
+
+        // 3. 校验本次购买数量不超过余量
         if (ticket.getRemainingQuantity() < req.getQuantity()) {
             throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "余票不足");
         }
 
-        // 3. 扣减名额
+        // 4. 扣减名额
         ticket.setRemainingQuantity(ticket.getRemainingQuantity() - req.getQuantity());
         ticketCategoryMapper.updateById(ticket);
 
-        // 4. 创建订单
+        // 5. 创建订单（每次独立，不合并）
         Order order = new Order();
         order.setOrderNo(IdUtil.getSnowflakeNextIdStr());
         order.setUserId(userId);
         order.setTicketId(req.getTicketId());
         order.setQuantity(req.getQuantity());
         order.setTotalPrice(ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity())));
-        order.setStatus(0);                     // 待支付
-        order.setExpireTime(LocalDateTime.now().plusMinutes(15)); // 15分钟支付窗口
+        order.setStatus(0);
+        order.setExpireTime(LocalDateTime.now().plusMinutes(15));
         orderMapper.insert(order);
 
         log.info("订单创建: orderNo={}, userId={}, ticketId={}, qty={}",
@@ -132,15 +141,42 @@ public class OrderService {
 
     // ===================== 查询 =====================
 
-    public IPage<OrderVO> listOrders(Long userId, Integer pageNum, Integer pageSize, Integer status) {
-        Page<Order> page = new Page<>(pageNum, pageSize);
+    public IPage<EventOrderGroupVO> listOrders(Long userId, Integer pageNum, Integer pageSize, Integer status) {
+        // 1. 查全量订单，按创建时间倒序
         LambdaQueryWrapper<Order> wrapper = new LambdaQueryWrapper<Order>()
                 .eq(Order::getUserId, userId);
         if (status != null) {
             wrapper.eq(Order::getStatus, status);
         }
         wrapper.orderByDesc(Order::getCreateTime);
-        return orderMapper.selectPage(page, wrapper).convert(this::convertToVO);
+        List<Order> allOrders = orderMapper.selectList(wrapper);
+
+        // 2. 转VO并按eventId分组（保持首次出现顺序）
+        Map<Long, EventOrderGroupVO> groupMap = new LinkedHashMap<>();
+        for (Order order : allOrders) {
+            OrderVO vo = convertToVO(order);
+            EventOrderGroupVO group = groupMap.computeIfAbsent(vo.getEventId(), eid -> {
+                EventOrderGroupVO g = new EventOrderGroupVO();
+                g.setEventId(vo.getEventId());
+                g.setEventTitle(vo.getEventTitle());
+                g.setEventVenue(vo.getEventVenue());
+                g.setEventStartTime(vo.getEventStartTime());
+                g.setOrders(new ArrayList<>());
+                return g;
+            });
+            group.getOrders().add(vo);
+        }
+
+        // 3. 对分组做内存分页
+        List<EventOrderGroupVO> allGroups = new ArrayList<>(groupMap.values());
+        int total = allGroups.size();
+        int from = (pageNum - 1) * pageSize;
+        int to = Math.min(from + pageSize, total);
+        List<EventOrderGroupVO> pageGroups = from < total ? allGroups.subList(from, to) : new ArrayList<>();
+
+        Page<EventOrderGroupVO> result = new Page<>(pageNum, pageSize, total);
+        result.setRecords(pageGroups);
+        return result;
     }
 
     public OrderVO getOrderDetail(String orderNo) {
@@ -162,6 +198,39 @@ public class OrderService {
     private void validateStatus(Order order, int expected, String msg) {
         if (order.getStatus() != expected) {
             throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, msg);
+        }
+    }
+
+    /**
+     * 检查用户购买限制：每个活动只能买一类票，每类票最多5张
+     */
+    private void checkPurchaseLimit(Long userId, Long eventId, Long ticketId, int quantity) {
+        List<TicketCategory> allTickets = ticketCategoryMapper.selectList(
+                new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, eventId));
+        List<Long> ticketIds = allTickets.stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
+
+        // 查询用户在该活动下所有有效订单（排除已取消和已退款）
+        List<Order> existingOrders = orderMapper.selectList(
+                new LambdaQueryWrapper<Order>()
+                        .eq(Order::getUserId, userId)
+                        .in(Order::getTicketId, ticketIds)
+                        .notIn(Order::getStatus, 2, 3));
+
+        // 检查是否已购买其他票档
+        long differentCategoryCount = existingOrders.stream()
+                .filter(o -> !o.getTicketId().equals(ticketId))
+                .count();
+        if (differentCategoryCount > 0) {
+            throw new BusinessException("该活动您已购买其他票档，每个活动只能购买一类票");
+        }
+
+        // 检查累计购买数量
+        int totalPurchased = existingOrders.stream()
+                .filter(o -> o.getTicketId().equals(ticketId))
+                .mapToInt(Order::getQuantity)
+                .sum();
+        if (totalPurchased + quantity > 5) {
+            throw new BusinessException("该票档最多购买5张，您已购买" + totalPurchased + "张，还可购买" + (5 - totalPurchased) + "张");
         }
     }
 

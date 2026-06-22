@@ -11,3 +11,7 @@ export function getEventDetail(eventId) {
 export function getEventTickets(eventId) {
   return request.get(`/event/${eventId}/tickets`)
 }
+
+export function getPurchaseStatus(eventId) {
+  return request.get(`/event/${eventId}/purchase-status`)
+}

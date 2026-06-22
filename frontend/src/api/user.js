@@ -1,17 +1,25 @@
 import request from '../utils/request'
 
-export function followUser(followeeId) {
-  return request.post(`/user/follow/${followeeId}`)
+export function followUser(userId) {
+  return request.post(`/user/follow/${userId}`)
 }
 
-export function unfollowUser(followeeId) {
-  return request.delete(`/user/follow/${followeeId}`)
+export function unfollowUser(userId) {
+  return request.delete(`/user/follow/${userId}`)
 }
 
 export function getFollowStats() {
   return request.get('/user/follow/stats')
 }
 
-export function checkFollowing(followeeId) {
-  return request.get(`/user/follow/check/${followeeId}`)
+export function checkFollowing(userId) {
+  return request.get(`/user/follow/check/${userId}`)
+}
+
+export function getFollowingList(params) {
+  return request.get('/user/follow/following', { params })
+}
+
+export function getFansList(params) {
+  return request.get('/user/follow/fans', { params })
 }

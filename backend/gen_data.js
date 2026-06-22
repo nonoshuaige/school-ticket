@@ -127,7 +127,9 @@ const noteLines = [];
 for (let i = 0; i < 200; i++) {
   const uid = rand(1, 100);
   const content = pick(noteContents);
-  const time = dt(0, rand(5,7), rand(1,28), rand(0,23), rand(0,59));
+  const m = rand(3, 6);
+  const d = m === 6 ? rand(1, 21) : rand(1, 28);
+  const time = dt(0, m, d, rand(0,23), rand(0,59));
   noteLines.push(`(${uid}, '${content.replace(/'/g, "''")}', ${time})`);
 }
 lines.push('-- 200 条随机笔记');
@@ -147,7 +149,7 @@ for (let i = 0; i < 300; i++) {
   followLines.push(`(${f1}, ${f2})`);
 }
 lines.push('-- 随机关注关系');
-lines.push('INSERT INTO `user_follow` (`follower_id`, `followee_id`) VALUES');
+lines.push('INSERT INTO `user_follow` (`follower_id`, `user_id`) VALUES');
 lines.push(followLines.join(',\n') + ';');
 lines.push('');
 
