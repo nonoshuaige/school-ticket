@@ -1,8 +1,19 @@
 import request from '../utils/request'
 
 export function getNoteList(params) {
-  // cursor-based: { cursor, pageSize, sort }
   return request.get('/note/list', { params })
+}
+
+export function getRecommendFeed(params) {
+  return request.get('/note/recommend-feed', { params })
+}
+
+export function getFollowingFeed(params) {
+  return request.get('/note/following-feed', { params })
+}
+
+export function getMyNotes(params) {
+  return request.get('/note/my-notes', { params })
 }
 
 export function getNoteDetail(noteId) {

@@ -3,9 +3,8 @@
     <van-nav-bar title="笔记" fixed placeholder />
     <van-sticky offset-top="46">
       <div class="sort-tabs">
-        <span :class="{ active: sortMode === 'hottest' }" @click="switchSort('hottest')">最热</span>
-        <span :class="{ active: sortMode === 'latest' }" @click="switchSort('latest')">最新</span>
-        <span :class="{ active: sortMode === 'mine' }" @click="switchSort('mine')">我的</span>
+        <span :class="{ active: feedMode === 'recommend' }" @click="switchFeed('recommend')">推荐</span>
+        <span :class="{ active: feedMode === 'following' }" @click="switchFeed('following')">关注</span>
       </div>
     </van-sticky>
     <van-pull-refresh v-model="refreshing" @refresh="onRefresh">
@@ -43,7 +42,7 @@
 
         <div v-if="notes.length === 0 && !loading" class="empty-state">
           <van-icon name="notes-o" size="48" color="#ccc"/>
-          <p>暂无笔记</p>
+          <p>{{ feedMode === 'following' ? '关注的人还没有发布笔记' : '暂无推荐笔记' }}</p>
         </div>
       </div>
     </van-pull-refresh>
@@ -88,22 +87,21 @@
 import { ref, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast, showSuccessToast } from 'vant'
-import { getNoteList, createNote, likeNote, unlikeNote } from '../api/note'
-import { followUser, unfollowUser } from '../api/user'
+import { getRecommendFeed, getFollowingFeed, createNote, likeNote, unlikeNote } from '../api/note'
+import { followUser, unfollowUser, checkFollowing } from '../api/user'
 import { useUserStore } from '../stores/user'
 import BottomNav from '../components/BottomNav.vue'
 
 const router = useRouter()
 const userStore = useUserStore()
 const notes = ref([])
-const total = ref(0)
 const showPublish = ref(false)
 const publishContent = ref('')
 const loading = ref(false)
 const refreshing = ref(false)
 const loadingMore = ref(false)
 const pageSize = 10
-const sortMode = ref('hottest')
+const feedMode = ref('recommend')
 const nextCursor = ref(null)
 const hasMore = ref(false)
 
@@ -119,12 +117,8 @@ const gradients = [
 ]
 const emojis = ['🌸','🎵','📖','🍔','🏃','📷','🎮','✨','🌈','🎨','🍕','🎬','📝','💡','🌟','🔥']
 
-function coverGradient(id) {
-  return gradients[id % gradients.length]
-}
-function coverEmoji(id) {
-  return emojis[id % emojis.length]
-}
+function coverGradient(id) { return gradients[id % gradients.length] }
+function coverEmoji(id) { return emojis[id % emojis.length] }
 
 function formatTime(dateStr) {
   if (!dateStr) return ''
@@ -133,13 +127,13 @@ function formatTime(dateStr) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 }
 
-function switchSort(mode) {
-  if (mode === 'mine' && !userStore.isLoggedIn) {
+function switchFeed(mode) {
+  if (mode === 'following' && !userStore.isLoggedIn) {
     showToast('请先登录')
     return
   }
-  if (sortMode.value === mode) return
-  sortMode.value = mode
+  if (feedMode.value === mode) return
+  feedMode.value = mode
   nextCursor.value = null
   notes.value = []
   loadNotes()
@@ -148,10 +142,16 @@ function switchSort(mode) {
 async function loadNotes() {
   loading.value = true
   try {
-    const res = await getNoteList({ cursor: nextCursor.value, pageSize, sort: sortMode.value })
+    let res
+    if (feedMode.value === 'recommend') {
+      res = await getRecommendFeed({ cursor: nextCursor.value, pageSize })
+    } else {
+      res = await getFollowingFeed({ cursor: nextCursor.value, pageSize })
+    }
     const records = res.records || []
+
+    // 批量查关注状态
     if (userStore.isLoggedIn) {
-      const { checkFollowing } = await import('../api/user')
       for (const item of records) {
         if (item.userId === userStore.userInfo?.userId) {
           item.isFollowing = false
@@ -165,8 +165,8 @@ async function loadNotes() {
     } else {
       records.forEach(r => { r.isFollowing = false; r._loaded = true })
     }
+
     notes.value = records
-    total.value = res.total || 0
     nextCursor.value = res.nextCursor || null
     hasMore.value = res.hasMore || false
   } catch {} finally {
@@ -178,10 +178,15 @@ async function loadMore() {
   if (!hasMore.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    const res = await getNoteList({ cursor: nextCursor.value, pageSize, sort: sortMode.value })
+    let res
+    if (feedMode.value === 'recommend') {
+      res = await getRecommendFeed({ cursor: nextCursor.value, pageSize })
+    } else {
+      res = await getFollowingFeed({ cursor: nextCursor.value, pageSize })
+    }
     const records = res.records || []
+
     if (userStore.isLoggedIn) {
-      const { checkFollowing } = await import('../api/user')
       for (const item of records) {
         if (item.userId === userStore.userInfo?.userId) {
           item.isFollowing = false
@@ -195,8 +200,8 @@ async function loadMore() {
     } else {
       records.forEach(r => { r.isFollowing = false; r._loaded = true })
     }
+
     notes.value.push(...records)
-    total.value = res.total || 0
     nextCursor.value = res.nextCursor || null
     hasMore.value = res.hasMore || false
   } catch {} finally {
@@ -358,7 +363,6 @@ onMounted(() => { loadNotes() })
   flex-shrink: 0;
 }
 .author-name { font-size: 11px; color: #999; max-width: 60px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.note-actions { display: flex; align-items: center; gap: 10px; }
 .like-btn {
   display: inline-flex;
   align-items: center;

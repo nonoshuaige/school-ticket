@@ -17,6 +17,7 @@
 
     <van-cell-group inset style="margin: 16px 12px; border-radius: 10px;">
       <van-cell title="我的订单" is-link to="/mine/orders" icon="records-o" />
+      <van-cell title="我的笔记" is-link to="/mine/notes" icon="notes-o" />
     </van-cell-group>
 
     <BottomNav />

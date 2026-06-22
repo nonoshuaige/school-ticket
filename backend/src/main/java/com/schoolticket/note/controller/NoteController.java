@@ -18,13 +18,37 @@ public class NoteController {
     private final NoteService noteService;
     private final NoteCommentService noteCommentService;
 
-    /** 笔记列表 - 游标分页 */
+    /** 笔记列表 - 游标分页（保留 latest / hottest，已移除 mine） */
     @GetMapping("/list")
     public Result<?> list(@RequestParam(required = false) Long cursor,
                           @RequestParam(defaultValue = "20") Integer pageSize,
                           @RequestParam(defaultValue = "latest") String sort) {
         Long userId = tryGetUserId();
         return Result.success(noteService.listNotes(cursor, pageSize, userId, sort));
+    }
+
+    /** 推荐流 - 布隆过滤器消重 + 游标翻页 */
+    @GetMapping("/recommend-feed")
+    public Result<?> recommendFeed(@RequestParam(required = false) Long cursor,
+                                   @RequestParam(defaultValue = "10") Integer pageSize) {
+        Long userId = tryGetUserId();
+        return Result.success(noteService.recommendFeed(userId, cursor, pageSize));
+    }
+
+    /** 关注流 - 拉模式时序聚合 */
+    @GetMapping("/following-feed")
+    public Result<?> followingFeed(@RequestParam(required = false) Long cursor,
+                                   @RequestParam(defaultValue = "10") Integer pageSize) {
+        Long userId = tryGetUserId();
+        return Result.success(noteService.followingFeed(userId, cursor, pageSize));
+    }
+
+    /** 我的笔记 - 独立分页（需登录） */
+    @GetMapping("/my-notes")
+    public Result<?> myNotes(@RequestParam(required = false) Long cursor,
+                             @RequestParam(defaultValue = "10") Integer pageSize) {
+        Long userId = requireUserId();
+        return Result.success(noteService.myNotes(userId, cursor, pageSize));
     }
 
     /** 冷启动：同步 MySQL → Redis */

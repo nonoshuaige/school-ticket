@@ -12,6 +12,8 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
 
@@ -75,6 +77,11 @@ public class RedisNoteRankingService {
         return queryNotePage(String.format(KEY_MINE, userId), cursor, pageSize, currentUserId);
     }
 
+    /** 查询单个 noteId 在 hottest ZSET 中的得分 */
+    public Double getNoteHottestScore(Long noteId) {
+        return redis.opsForZSet().score(KEY_HOTTEST, String.valueOf(noteId));
+    }
+
     /** 冷启动：从数据库同步数据到 Redis */
     public void syncAllFromDB() {
         List<Note> allNotes = noteMapper.selectList(null);
@@ -90,6 +97,47 @@ public class RedisNoteRankingService {
                 redis.opsForZSet().add(KEY_HOTTEST, String.valueOf(entry.getKey()), entry.getValue());
             }
         }
+    }
+
+    // ==================== 候选池（推荐流用） ====================
+
+    /** 从最新池中捞出至多 count 个随机候选 noteId，扫描窗口为 [offset, offset+windowSize) */
+    public List<Long> getCandidateIds(int count, int offset, int windowSize) {
+        long total = Optional.ofNullable(redis.opsForZSet().zCard(KEY_LATEST)).orElse(0L);
+        if (total == 0) return Collections.emptyList();
+        int startRank = offset;
+        int endRank = Math.min(startRank + windowSize - 1, (int) total - 1);
+        if (startRank >= total) return Collections.emptyList();
+        Set<String> idSet = redis.opsForZSet().reverseRange(KEY_LATEST, startRank, endRank);
+        if (idSet == null || idSet.isEmpty()) return Collections.emptyList();
+        List<Long> all = idSet.stream().map(Long::valueOf).collect(Collectors.toList());
+        Collections.shuffle(all);
+        return all.size() <= count ? all : all.subList(0, count);
+    }
+
+    public List<Long> getCandidateIds(int count) {
+        return getCandidateIds(count, 0, count * 3);
+    }
+
+    public long getLatestTotal() {
+        Long total = redis.opsForZSet().zCard(KEY_LATEST);
+        return total == null ? 0 : total;
+    }
+
+    /** 批量获取多个作者的 note:mine ZSET（返回 noteId → score），最大每作者取 limit 条 */
+    public Map<Long, Long> batchGetAuthorNoteIds(Set<Long> authorIds, int limitPerAuthor) {
+        Map<Long, Long> result = new LinkedHashMap<>();
+        for (Long authorId : authorIds) {
+            String key = String.format(KEY_MINE, authorId);
+            Set<String> ids = redis.opsForZSet().reverseRange(key, 0, limitPerAuthor - 1);
+            if (ids == null) continue;
+            for (String idStr : ids) {
+                Long nid = Long.valueOf(idStr);
+                Double score = redis.opsForZSet().score(key, idStr);
+                if (score != null) result.put(nid, score.longValue());
+            }
+        }
+        return result;
     }
 
     // ==================== 内部 ====================

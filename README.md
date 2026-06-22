@@ -10,7 +10,7 @@
 | 🎪 活动 | 热卖中/预热中分组、双列网格、真实最低票价、分页浏览 |
 | 🎟️ 购票 | 选票档 → 确认下单（名额扣减）→ 模拟支付 → 倒计时关单 |
 | 📦 订单 | 待支付→已支付→已核销 / 已取消 / 已退款，五态流转 |
-| 📝 笔记 | 双列小红书风格、三种排行（最热/最新/我的）、游标分页加载更多、发布笔记、点赞/取消、关注/取关、笔记详情、二级展平评论 |
+| 📝 笔记 | 双列小红书风格、推荐流（布隆消重）+ 关注流（拉模式聚合）双 Feed、无限滚动、发布笔记、点赞/取消、关注/取关、笔记详情、二级展平评论、我的笔记独立入口 |
 | 📱 导航 | 底部三 Tab：购票、笔记、我的 |
 
 ## 技术栈
@@ -100,7 +100,9 @@ npm run dev
 
 ## 架构亮点
 
-- **Redis ZSET 游标分页**：笔记排行（最热/最新/我的）和关注/粉丝列表均基于 ZSET + `ZREVRANGEBYSCORE` 实现，支持无限滚动加载更多
+- **推荐流布隆消重**：基于 Redis BitMap 的分布式布隆过滤器，每用户独立 key（7天 TTL，~12KB），`pageSize × 3` 候选窗口 + 排名偏移无限滚动
+- **关注流拉模式聚合**：读取关注列表 → 批量拉取各作者 ZSET → 内存按时间戳降序合并 → 游标分页，严格时序不重复
+- **Redis ZSET 游标分页**：关注/粉丝列表基于 ZSET + `ZREVRANGEBYSCORE` 实现高性能分页
 - **MySQL + Redis 双写**：写入 MySQL 成功后同步更新 Redis ZSET，RabbitMQ 消息队列作为异步兜底
 - **二级展平评论**：仿小红书/B站的评论结构，一级评论分页，子回复展平加载，软删除 + 级联删除
 - **冷启动同步**：系统启动后调用 sync 接口将 MySQL 存量数据全量写入 Redis
@@ -115,7 +117,9 @@ npm run dev
 | GET | /api/v1/event/{id} | 活动详情+票档 |
 | POST | /api/v1/order/create | 创建订单 |
 | GET | /api/v1/order/list?status=&page= | 订单列表（分页） |
-| GET | /api/v1/note/list?cursor=&pageSize=&sort= | 笔记列表（游标分页，sort=latest\|hottest\|mine） |
+| GET | /api/v1/note/recommend-feed?cursor=&pageSize= | 推荐流（布隆消重 + 无限滚动） |
+| GET | /api/v1/note/following-feed?cursor=&pageSize= | 关注流（拉模式时序聚合） |
+| GET | /api/v1/note/my-notes?cursor=&pageSize= | 我的笔记（需登录） |
 | POST | /api/v1/note/create | 发布笔记 |
 | GET | /api/v1/note/{id} | 笔记详情 |
 | POST | /api/v1/note/{id}/like | 点赞 |

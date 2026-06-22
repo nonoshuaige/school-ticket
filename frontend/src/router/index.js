@@ -15,6 +15,7 @@ const routes = [
 
   { path: '/mine', name: 'Mine', component: () => import('../views/Mine.vue') },
   { path: '/mine/orders', name: 'MyOrders', component: () => import('../views/MyOrders.vue'), meta: { requiresAuth: true } },
+  { path: '/mine/notes', name: 'MyNotes', component: () => import('../views/MyNotes.vue'), meta: { requiresAuth: true } },
   { path: '/mine/detail/:orderNo', name: 'TicketDetail', component: () => import('../views/TicketDetail.vue'), meta: { requiresAuth: true } },
 ]
 
