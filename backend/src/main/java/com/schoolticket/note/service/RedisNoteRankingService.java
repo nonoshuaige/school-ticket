@@ -2,16 +2,14 @@ package com.schoolticket.note.service;
 
 import com.schoolticket.dto.CursorPage;
 import com.schoolticket.note.entity.Note;
-import com.schoolticket.note.entity.NoteLike;
-import com.schoolticket.note.mapper.NoteLikeMapper;
 import com.schoolticket.note.mapper.NoteMapper;
 import com.schoolticket.user.entity.User;
 import com.schoolticket.user.mapper.UserMapper;
-import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.*;
@@ -23,7 +21,6 @@ public class RedisNoteRankingService {
 
     private final StringRedisTemplate redis;
     private final NoteMapper noteMapper;
-    private final NoteLikeMapper noteLikeMapper;
     private final UserMapper userMapper;
 
     private static final String KEY_LATEST  = "note:latest";
@@ -32,6 +29,7 @@ public class RedisNoteRankingService {
     private static final String FEED_FOLLOWING_KEY = "feed:following:%d";
     private static final String VO_KEY       = "note:vo:%d";
     private static final String LIKE_COUNT_KEY = "note:like:count:%d";
+    private static final String USER_LIKES_KEY = "user:likes:%d";
     private static final int    FEED_FOLLOWING_CAP = 800;
     private static final long   VO_TTL_SECONDS = 7 * 24 * 3600;
 
@@ -138,19 +136,38 @@ public class RedisNoteRankingService {
         redis.expire(key, VO_TTL_SECONDS, java.util.concurrent.TimeUnit.SECONDS);
     }
 
-    /** 批量读取 VO 缓存，返回 noteId → fields 的 map（miss 的不在 map 中） */
+    /** 批量读取 VO 缓存（pipeline HGETALL），返回 noteId → fields 的 map（miss 的不在 map 中） */
     public Map<Long, Map<String, String>> batchGetNoteVOs(List<Long> noteIds) {
         Map<Long, Map<String, String>> result = new LinkedHashMap<>();
         if (noteIds.isEmpty()) return result;
 
+        // pipeline 所有 HGETALL
+        List<byte[]> rawKeys = new ArrayList<>();
         for (Long nid : noteIds) {
-            Map<Object, Object> entries = redis.opsForHash().entries(String.format(VO_KEY, nid));
-            if (entries != null && !entries.isEmpty()) {
-                Map<String, String> fields = new LinkedHashMap<>();
-                for (Map.Entry<Object, Object> e : entries.entrySet()) {
-                    fields.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+            rawKeys.add(String.format(VO_KEY, nid).getBytes(StandardCharsets.UTF_8));
+        }
+
+        List<Object> results = redis.executePipelined(
+                (org.springframework.data.redis.connection.RedisConnection connection) -> {
+            for (byte[] key : rawKeys) {
+                connection.hGetAll(key);
+            }
+            return null;
+        });
+
+        // 解析结果：StringRedisTemplate 将 HGETALL 结果反序列化为 Map<String, String>
+        for (int i = 0; i < noteIds.size(); i++) {
+            Object obj = results.get(i);
+            if (obj instanceof Map) {
+                @SuppressWarnings("unchecked")
+                Map<Object, Object> raw = (Map<Object, Object>) obj;
+                if (!raw.isEmpty()) {
+                    Map<String, String> fields = new LinkedHashMap<>();
+                    for (Map.Entry<Object, Object> e : raw.entrySet()) {
+                        fields.put(String.valueOf(e.getKey()), String.valueOf(e.getValue()));
+                    }
+                    result.put(noteIds.get(i), fields);
                 }
-                result.put(nid, fields);
             }
         }
         return result;
@@ -213,6 +230,54 @@ public class RedisNoteRankingService {
 
     public void setLikeCount(Long noteId, long count) {
         redis.opsForValue().set(String.format(LIKE_COUNT_KEY, noteId), String.valueOf(count));
+    }
+
+    // ==================== 用户点赞 Set（user:likes:{userId}） ====================
+
+    public void saddUserLike(Long userId, Long noteId) {
+        redis.opsForSet().add(String.format(USER_LIKES_KEY, userId), String.valueOf(noteId));
+    }
+
+    public void sremUserLike(Long userId, Long noteId) {
+        redis.opsForSet().remove(String.format(USER_LIKES_KEY, userId), String.valueOf(noteId));
+    }
+
+    public boolean isLiked(Long userId, Long noteId) {
+        return Boolean.TRUE.equals(
+                redis.opsForSet().isMember(String.format(USER_LIKES_KEY, userId), String.valueOf(noteId)));
+    }
+
+    /** 批量检查用户是否点赞（pipeline SISMEMBER），返回已点赞的 noteId 集合 */
+    public Set<Long> batchCheckLiked(Long userId, List<Long> noteIds) {
+        Set<Long> result = new HashSet<>();
+        if (userId == null || noteIds.isEmpty()) return result;
+        byte[] keyBytes = String.format(USER_LIKES_KEY, userId).getBytes(StandardCharsets.UTF_8);
+
+        List<Object> results = redis.executePipelined(
+                (org.springframework.data.redis.connection.RedisConnection connection) -> {
+            for (Long nid : noteIds) {
+                connection.sIsMember(keyBytes, String.valueOf(nid).getBytes(StandardCharsets.UTF_8));
+            }
+            return null;
+        });
+
+        int i = 0;
+        for (Long nid : noteIds) {
+            if (Boolean.TRUE.equals(results.get(i))) {
+                result.add(nid);
+            }
+            i++;
+        }
+        return result;
+    }
+
+    /** 冷启动：从 note_like 表按用户分组写入 Redis Set */
+    public void syncUserLikesFromMap(Map<Long, Set<Long>> userLikesMap) {
+        for (Map.Entry<Long, Set<Long>> entry : userLikesMap.entrySet()) {
+            String key = String.format(USER_LIKES_KEY, entry.getKey());
+            String[] members = entry.getValue().stream().map(String::valueOf).toArray(String[]::new);
+            redis.opsForSet().add(key, members);
+        }
     }
 
     // ==================== 游标分页查询 ====================
@@ -353,16 +418,10 @@ public class RedisNoteRankingService {
             if (score != null) likeCountMap.put(nid, score.longValue());
         }
 
-        // 查当前用户是否点赞 (MySQL)
+        // 查当前用户是否点赞 (Redis Set)
         Set<Long> likedSet = Collections.emptySet();
         if (currentUserId != null && !noteIds.isEmpty()) {
-            likedSet = noteLikeMapper.selectList(
-                    new LambdaQueryWrapper<NoteLike>()
-                            .in(NoteLike::getNoteId, noteIds)
-                            .eq(NoteLike::getUserId, currentUserId))
-                    .stream()
-                    .map(NoteLike::getNoteId)
-                    .collect(Collectors.toSet());
+            likedSet = batchCheckLiked(currentUserId, noteIds);
         }
 
         // 组装结果，保持 ZSET 排序顺序

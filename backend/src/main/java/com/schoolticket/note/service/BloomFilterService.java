@@ -5,6 +5,10 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -47,10 +51,65 @@ public class BloomFilterService {
     }
 
     /** 批量标记 */
-    public void addAll(Long userId, java.util.List<Long> noteIds) {
-        for (Long nid : noteIds) {
-            add(userId, nid);
+    public void addAll(Long userId, List<Long> noteIds) {
+        if (noteIds.isEmpty()) return;
+        String key = KEY_PREFIX + userId;
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+        redis.executePipelined((org.springframework.data.redis.connection.RedisConnection connection) -> {
+            for (Long nid : noteIds) {
+                byte[] raw = String.valueOf(nid).getBytes(StandardCharsets.UTF_8);
+                long[] offsets = hash(raw);
+                for (long offset : offsets) {
+                    connection.setBit(keyBytes, offset, true);
+                }
+            }
+            return null;
+        });
+        redis.expire(key, TTL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /** 批量检查，返回未被曝光过的 noteId 集合 */
+    public Set<Long> batchFilterSeen(Long userId, List<Long> noteIds) {
+        Set<Long> fresh = new LinkedHashSet<>();
+        if (noteIds.isEmpty()) return fresh;
+        String key = KEY_PREFIX + userId;
+        // 首次使用：bloom key 不存在 → 全部都是新鲜的，跳过 GETBIT
+        if (Boolean.FALSE.equals(redis.hasKey(key))) {
+            fresh.addAll(noteIds);
+            return fresh;
         }
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
+        // 为每个 noteId 预计算 7 个 offset
+        Map<Long, long[]> offsetMap = new java.util.LinkedHashMap<>();
+        for (Long nid : noteIds) {
+            offsetMap.put(nid, hash(String.valueOf(nid).getBytes(StandardCharsets.UTF_8)));
+        }
+        // pipeline 所有 GETBIT
+        List<Object> results = redis.executePipelined(
+                (org.springframework.data.redis.connection.RedisConnection connection) -> {
+                    for (long[] offsets : offsetMap.values()) {
+                        for (long offset : offsets) {
+                            connection.getBit(keyBytes, offset);
+                        }
+                    }
+                    return null;
+                });
+        // 解析结果
+        int idx = 0;
+        for (Map.Entry<Long, long[]> entry : offsetMap.entrySet()) {
+            boolean seen = true;
+            for (int i = 0; i < HASH_COUNT; i++) {
+                Object val = results.get(idx++);
+                if (!Boolean.TRUE.equals(val)) {
+                    seen = false;
+                    break;
+                }
+            }
+            if (!seen) {
+                fresh.add(entry.getKey());
+            }
+        }
+        return fresh;
     }
 
     private long[] hash(byte[] raw) {

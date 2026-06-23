@@ -11,6 +11,7 @@ import com.schoolticket.user.entity.User;
 import com.schoolticket.user.mapper.UserMapper;
 import com.schoolticket.user.service.RedisFollowService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.dao.DuplicateKeyException;
@@ -23,6 +24,7 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class NoteService {
@@ -56,64 +58,95 @@ public class NoteService {
      * cursor != null → 上拉加载：LPOP 下一页
      */
     public CursorPage<Map<String, Object>> recommendFeed(Long currentUserId, Long cursor, int pageSize) {
+        long t0 = System.currentTimeMillis();
         Long effectiveUserId = currentUserId != null ? currentUserId : 0L;
         String feedKey = String.format(FEED_KEY, effectiveUserId);
 
+        long tSnap = 0, tPush = 0, tPop = 0, tBloom = 0, tVO = 0;
         if (cursor == null) {
-            // 下拉刷新：重新生成快照
+            long _t = System.currentTimeMillis();
             List<Long> snapshot = generateFeedSnapshot(effectiveUserId);
+            tSnap = System.currentTimeMillis() - _t;
+
+            _t = System.currentTimeMillis();
             redis.delete(feedKey);
             if (!snapshot.isEmpty()) {
                 redis.opsForList().rightPushAll(feedKey, snapshot.stream().map(String::valueOf).toList());
                 redis.expire(feedKey, FEED_TTL_MINUTES, TimeUnit.MINUTES);
             }
+            tPush = System.currentTimeMillis() - _t;
         }
 
-        // 上拉加载 / 首页：从私有 List LPOP 取 pageSize 条
+        long _t = System.currentTimeMillis();
+        // pipeline 批量 LPOP
+        List<Object> poppedRaw = redis.executePipelined(
+                (org.springframework.data.redis.connection.RedisConnection connection) -> {
+            byte[] keyBytes = feedKey.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            for (int i = 0; i < pageSize; i++) {
+                connection.lPop(keyBytes);
+            }
+            return null;
+        });
         List<String> popped = new ArrayList<>();
-        for (int i = 0; i < pageSize; i++) {
-            String val = redis.opsForList().leftPop(feedKey);
-            if (val == null) break;
-            popped.add(val);
+        for (Object o : poppedRaw) {
+            if (o == null) break;
+            popped.add(String.valueOf(o));
         }
+        tPop = System.currentTimeMillis() - _t;
 
         if (popped.isEmpty()) {
+            log.info("recommendFeed total={}ms | snap={}ms push={}ms pop={}ms (empty)",
+                    System.currentTimeMillis() - t0, tSnap, tPush, tPop);
             return CursorPage.of(Collections.emptyList(), null, false, 0);
         }
 
         List<Long> noteIds = popped.stream().map(Long::valueOf).collect(Collectors.toList());
 
-        // 标记已曝光
+        _t = System.currentTimeMillis();
         if (currentUserId != null) {
             bloomFilterService.addAll(currentUserId, noteIds);
         }
+        tBloom = System.currentTimeMillis() - _t;
 
+        _t = System.currentTimeMillis();
         List<Map<String, Object>> records = assembleNoteVOsWithRepair(noteIds, currentUserId);
+        tVO = System.currentTimeMillis() - _t;
 
-        // 还有剩余 → hasMore，nextCursor 为信号值（非 null 即触发上拉加载）
         Long remaining = redis.opsForList().size(feedKey);
         boolean hasMore = remaining != null && remaining > 0;
+
+        log.info("recommendFeed total={}ms | snap={}ms push={}ms pop={}ms bloom={}ms vo={}ms",
+                System.currentTimeMillis() - t0, tSnap, tPush, tPop, tBloom, tVO);
         return CursorPage.of(records, hasMore ? "0" : null, hasMore, records.size());
     }
 
     /** 从全站最新候选池中生成一个去重后的快照 ID 列表 */
     private List<Long> generateFeedSnapshot(Long effectiveUserId) {
+        long t0 = System.currentTimeMillis();
+
+        long tz = System.currentTimeMillis();
         long total = noteRankingService.getLatestTotal();
+        long tZcard = System.currentTimeMillis() - tz;
         if (total == 0) return Collections.emptyList();
 
-        // 取最新 600 条，shuffle 后过布隆，截取 FEED_SNAPSHOT_SIZE 条
         int fetchSize = (int) Math.min(total, 600);
+
+        long t1 = System.currentTimeMillis();
         List<Long> candidates = noteRankingService.getCandidateIds(fetchSize, 0, fetchSize);
+        long tCand = System.currentTimeMillis() - t1;
         if (candidates.isEmpty()) return Collections.emptyList();
 
-        List<Long> fresh = new ArrayList<>();
-        for (Long nid : candidates) {
-            if (!bloomFilterService.mightContain(effectiveUserId, nid)) {
-                fresh.add(nid);
-                if (fresh.size() >= FEED_SNAPSHOT_SIZE) break;
-            }
-        }
-        return fresh;
+        long t2 = System.currentTimeMillis();
+        List<Long> fresh = new ArrayList<>(bloomFilterService.batchFilterSeen(effectiveUserId, candidates));
+        long tBloom = System.currentTimeMillis() - t2;
+
+        long t3 = System.currentTimeMillis();
+        List<Long> result = fresh.size() <= FEED_SNAPSHOT_SIZE ? fresh : fresh.subList(0, FEED_SNAPSHOT_SIZE);
+        long tTrim = System.currentTimeMillis() - t3;
+
+        log.info("generateFeedSnapshot total={}ms | zcard={}ms zrange={}ms bloom={}ms trim={}ms | candidates={} fresh={}",
+                System.currentTimeMillis() - t0, tZcard, tCand, tBloom, tTrim, candidates.size(), fresh.size());
+        return result;
     }
 
     // ==================== 关注流（推模式：读自己收件箱） ====================
@@ -210,10 +243,7 @@ public class NoteService {
 
         boolean isLiked = false;
         if (currentUserId != null) {
-            isLiked = noteLikeMapper.selectCount(
-                    new LambdaQueryWrapper<NoteLike>()
-                            .eq(NoteLike::getNoteId, noteId)
-                            .eq(NoteLike::getUserId, currentUserId)) > 0;
+            isLiked = noteRankingService.isLiked(currentUserId, noteId);
         }
 
         User author = userMapper.selectById(note.getUserId());
@@ -238,6 +268,7 @@ public class NoteService {
     public void like(Long noteId, Long userId) {
         // 1. Redis 先行
         long newCount = noteRankingService.incrLikeCount(noteId);
+        noteRankingService.saddUserLike(userId, noteId);
         noteRankingService.updateVOLikeCount(noteId, 1);
         noteRankingService.updateLikeCount(noteId, newCount);
 
@@ -263,6 +294,7 @@ public class NoteService {
     public void unlike(Long noteId, Long userId) {
         // 1. Redis 先行
         noteRankingService.decrLikeCount(noteId);
+        noteRankingService.sremUserLike(userId, noteId);
         noteRankingService.updateVOLikeCount(noteId, -1);
 
         // 2. MySQL 删除
@@ -291,13 +323,16 @@ public class NoteService {
         // 1. 同步 latest + mine ZSET
         noteRankingService.syncAllFromDB();
 
-        // 2. 同步点赞计数 + VO 缓存
+        // 2. 同步点赞计数 + VO 缓存 + 用户点赞 Set
         List<NoteLike> allLikes = noteLikeMapper.selectList(null);
         Map<Long, Long> likeCountMap = new HashMap<>();
+        Map<Long, Set<Long>> userLikesMap = new HashMap<>();
         for (NoteLike lk : allLikes) {
             likeCountMap.merge(lk.getNoteId(), 1L, Long::sum);
+            userLikesMap.computeIfAbsent(lk.getUserId(), k -> new HashSet<>()).add(lk.getNoteId());
         }
         noteRankingService.syncLikesFromDB(likeCountMap);
+        noteRankingService.syncUserLikesFromMap(userLikesMap);
 
         // 3. 回填 VO 缓存 + 点赞计数器 + 收件箱 fanout
         List<Note> allNotes = noteMapper.selectList(null);
@@ -396,16 +431,12 @@ public class NoteService {
             }
         }
 
-        // 3. 批量查当前用户点赞状态 (MySQL)
+        // 3. 批量查当前用户点赞状态 (Redis Set)
         Set<Long> likedSet = Collections.emptySet();
         if (currentUserId != null) {
             List<Long> validIds = noteIds.stream().filter(cachedVOs::containsKey).collect(Collectors.toList());
             if (!validIds.isEmpty()) {
-                likedSet = noteLikeMapper.selectList(
-                        new LambdaQueryWrapper<NoteLike>()
-                                .in(NoteLike::getNoteId, validIds)
-                                .eq(NoteLike::getUserId, currentUserId))
-                        .stream().map(NoteLike::getNoteId).collect(Collectors.toSet());
+                likedSet = noteRankingService.batchCheckLiked(currentUserId, validIds);
             }
         }
 
