@@ -62,6 +62,9 @@ public class NoteService {
         Long effectiveUserId = currentUserId != null ? currentUserId : 0L;
         String feedKey = String.format(FEED_KEY, effectiveUserId);
 
+        // 懒加载：全局候选池过期则从 DB 重建
+        noteRankingService.ensureLatestLoaded();
+
         long tSnap = 0, tPush = 0, tPop = 0, tBloom = 0, tVO = 0;
         if (cursor == null) {
             long _t = System.currentTimeMillis();
@@ -154,6 +157,10 @@ public class NoteService {
     public CursorPage<Map<String, Object>> followingFeed(Long currentUserId, Long cursor, int pageSize) {
         if (currentUserId == null) return CursorPage.of(Collections.emptyList(), null, false, 0);
 
+        // 懒加载：收件箱过期则从关注列表 + 作者笔记重建
+        Set<Long> followingIds = redisFollowService.getFollowingIds(currentUserId);
+        noteRankingService.ensureInboxLoaded(currentUserId, followingIds);
+
         CursorPage<Map<String, Object>> inboxPage = noteRankingService.getFollowingFeedInbox(currentUserId, cursor, pageSize);
         if (inboxPage.getRecords().isEmpty()) return inboxPage;
 
@@ -168,6 +175,7 @@ public class NoteService {
     // ==================== 我的笔记（独立分页） ====================
 
     public CursorPage<Map<String, Object>> myNotes(Long userId, Long cursor, int pageSize) {
+        noteRankingService.ensureMineLoaded(userId);
         return noteRankingService.getMine(userId, cursor, pageSize, userId);
     }
 
@@ -243,6 +251,7 @@ public class NoteService {
 
         boolean isLiked = false;
         if (currentUserId != null) {
+            noteRankingService.ensureUserLikesLoaded(currentUserId);
             isLiked = noteRankingService.isLiked(currentUserId, noteId);
         }
 
@@ -319,56 +328,22 @@ public class NoteService {
 
     // ==================== 冷启动 ====================
 
+    /** 冷启动：仅同步全局池（latest + hottest + 点赞计数器），用户级数据由懒加载按需构建 */
     public void syncAllToRedis() {
-        // 1. 同步 latest + mine ZSET
+        // 1. 同步 latest + hottest 全局 ZSET
         noteRankingService.syncAllFromDB();
 
-        // 2. 同步点赞计数 + VO 缓存 + 用户点赞 Set
+        // 2. 同步点赞计数到 hottest ZSET
         List<NoteLike> allLikes = noteLikeMapper.selectList(null);
         Map<Long, Long> likeCountMap = new HashMap<>();
-        Map<Long, Set<Long>> userLikesMap = new HashMap<>();
         for (NoteLike lk : allLikes) {
             likeCountMap.merge(lk.getNoteId(), 1L, Long::sum);
-            userLikesMap.computeIfAbsent(lk.getUserId(), k -> new HashSet<>()).add(lk.getNoteId());
         }
         noteRankingService.syncLikesFromDB(likeCountMap);
-        noteRankingService.syncUserLikesFromMap(userLikesMap);
 
-        // 3. 回填 VO 缓存 + 点赞计数器 + 收件箱 fanout
-        List<Note> allNotes = noteMapper.selectList(null);
-        Set<Long> userIds = allNotes.stream().map(Note::getUserId).collect(Collectors.toSet());
-        Map<Long, User> userMap = new HashMap<>();
-        if (!userIds.isEmpty()) {
-            userMapper.selectBatchIds(userIds).forEach(u -> userMap.put(u.getUserId(), u));
-        }
-
-        // 构建作者 → 粉丝映射，一次性 fanout
-        Map<Long, Set<Long>> authorFanMap = new HashMap<>();
-
-        for (Note note : allNotes) {
-            long lc = likeCountMap.getOrDefault(note.getNoteId(), 0L);
-            noteRankingService.setLikeCount(note.getNoteId(), lc);
-
-            User author = userMap.get(note.getUserId());
-            Map<String, String> fields = new LinkedHashMap<>();
-            fields.put("content", note.getContent());
-            fields.put("userId", String.valueOf(note.getUserId()));
-            fields.put("nickname", author != null ? author.getNickname() : "");
-            fields.put("phone", author != null ? author.getPhone() : "");
-            fields.put("createTime", note.getCreateTime().toString());
-            fields.put("likeCount", String.valueOf(lc));
-            noteRankingService.cacheNoteVO(note.getNoteId(), fields);
-
-            // 批量 fanout 到粉丝收件箱（每个作者只查一次粉丝列表）
-            authorFanMap.computeIfAbsent(note.getUserId(),
-                    k -> redisFollowService.getFanIds(k));
-        }
-
-        // 执行 fanout
-        for (Note note : allNotes) {
-            Set<Long> fanIds = authorFanMap.getOrDefault(note.getUserId(), Collections.emptySet());
-            long timestamp = toEpochMilli(note.getCreateTime());
-            noteRankingService.fanoutToFollowers(note.getUserId(), note.getNoteId(), timestamp, fanIds);
+        // 3. 同步点赞计数器（note:like:count:{noteId}）
+        for (Map.Entry<Long, Long> entry : likeCountMap.entrySet()) {
+            noteRankingService.setLikeCount(entry.getKey(), entry.getValue());
         }
     }
 
@@ -434,6 +409,7 @@ public class NoteService {
         // 3. 批量查当前用户点赞状态 (Redis Set)
         Set<Long> likedSet = Collections.emptySet();
         if (currentUserId != null) {
+            noteRankingService.ensureUserLikesLoaded(currentUserId);
             List<Long> validIds = noteIds.stream().filter(cachedVOs::containsKey).collect(Collectors.toList());
             if (!validIds.isEmpty()) {
                 likedSet = noteRankingService.batchCheckLiked(currentUserId, validIds);

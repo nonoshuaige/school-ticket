@@ -1,11 +1,14 @@
 package com.schoolticket.user.service;
 
 import com.schoolticket.dto.CursorPage;
+import com.schoolticket.user.entity.UserFollow;
+import com.schoolticket.user.mapper.UserFollowMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Service
@@ -13,9 +16,11 @@ import java.util.stream.Collectors;
 public class RedisFollowService {
 
     private final StringRedisTemplate redis;
+    private final UserFollowMapper userFollowMapper;
 
     private static final String FOLLOW_KEY = "user:follow:%d";
     private static final String FANS_KEY  = "user:fans:%d";
+    private static final long   FOLLOW_TTL_SECONDS = 259200;
 
     // ==================== 写操作 ====================
 
@@ -23,15 +28,19 @@ public class RedisFollowService {
         long now = System.currentTimeMillis();
         String key = String.format(FOLLOW_KEY, followerId);
         redis.opsForZSet().add(key, String.valueOf(userId), now);
+        redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
         String fansKey = String.format(FANS_KEY, userId);
         redis.opsForZSet().add(fansKey, String.valueOf(followerId), now);
+        redis.expire(fansKey, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
     public void removeFollow(Long followerId, Long userId) {
         String key = String.format(FOLLOW_KEY, followerId);
         redis.opsForZSet().remove(key, String.valueOf(userId));
+        redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
         String fansKey = String.format(FANS_KEY, userId);
         redis.opsForZSet().remove(fansKey, String.valueOf(followerId));
+        redis.expire(fansKey, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
     public boolean isFollowing(Long followerId, Long userId) {
@@ -65,9 +74,50 @@ public class RedisFollowService {
 
     /** 获取全部粉丝 ID 集合（fanout 用） */
     public Set<Long> getFanIds(Long userId) {
+        ensureFansLoaded(userId);
         Set<String> members = redis.opsForZSet().range(String.format(FANS_KEY, userId), 0, -1);
         if (members == null || members.isEmpty()) return Collections.emptySet();
         return members.stream().map(Long::valueOf).collect(Collectors.toSet());
+    }
+
+    /** 获取全部关注 ID 集合 */
+    public Set<Long> getFollowingIds(Long userId) {
+        ensureFollowLoaded(userId);
+        Set<String> members = redis.opsForZSet().range(String.format(FOLLOW_KEY, userId), 0, -1);
+        if (members == null || members.isEmpty()) return Collections.emptySet();
+        return members.stream().map(Long::valueOf).collect(Collectors.toSet());
+    }
+
+    /** 确保 user:follow:{userId} 存在，过期则从 DB 重建 */
+    public void ensureFollowLoaded(Long userId) {
+        String key = String.format(FOLLOW_KEY, userId);
+        if (Boolean.TRUE.equals(redis.hasKey(key))) return;
+        List<UserFollow> follows = userFollowMapper.selectList(
+                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<UserFollow>()
+                        .eq(UserFollow::getFollowerId, userId));
+        for (UserFollow uf : follows) {
+            long score = uf.getCreateTime() != null
+                    ? uf.getCreateTime().atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
+                    : System.currentTimeMillis();
+            redis.opsForZSet().add(key, String.valueOf(uf.getUserId()), score);
+        }
+        redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /** 确保 user:fans:{userId} 存在，过期则从 DB 重建 */
+    public void ensureFansLoaded(Long userId) {
+        String key = String.format(FANS_KEY, userId);
+        if (Boolean.TRUE.equals(redis.hasKey(key))) return;
+        List<UserFollow> fans = userFollowMapper.selectList(
+                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<UserFollow>()
+                        .eq(UserFollow::getUserId, userId));
+        for (UserFollow uf : fans) {
+            long score = uf.getCreateTime() != null
+                    ? uf.getCreateTime().atZone(java.time.ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli()
+                    : System.currentTimeMillis();
+            redis.opsForZSet().add(key, String.valueOf(uf.getFollowerId()), score);
+        }
+        redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
     /** 批量获取关注时间（返回 followeeId → followTime） */

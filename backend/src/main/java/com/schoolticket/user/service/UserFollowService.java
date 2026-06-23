@@ -95,6 +95,7 @@ public class UserFollowService {
 
     /** 游标分页查询我的关注列表 */
     public CursorPage<Map<String, Object>> getFollowingList(Long userId, Long cursor, int pageSize) {
+        redisFollowService.ensureFollowLoaded(userId);
         CursorPage<Map<String, Object>> page = redisFollowService.getFollowing(userId, cursor, pageSize);
         if (page.getRecords().isEmpty()) return page;
 
@@ -118,6 +119,7 @@ public class UserFollowService {
 
     /** 游标分页查询我的粉丝列表 */
     public CursorPage<Map<String, Object>> getFansList(Long userId, Long cursor, int pageSize) {
+        redisFollowService.ensureFansLoaded(userId);
         CursorPage<Map<String, Object>> page = redisFollowService.getFans(userId, cursor, pageSize);
         if (page.getRecords().isEmpty()) return page;
 
@@ -141,11 +143,9 @@ public class UserFollowService {
         return page;
     }
 
-    /** 冷启动：从 MySQL 同步关注关系到 Redis */
-    public void syncFollowToRedis() {
-        List<UserFollow> allFollows = userFollowMapper.selectList(null);
-        for (UserFollow uf : allFollows) {
-            redisFollowService.addFollow(uf.getFollowerId(), uf.getUserId());
-        }
+    /** 冷启动：从 MySQL 同步当前用户的关注关系到 Redis */
+    public void syncFollowToRedis(Long userId) {
+        redisFollowService.ensureFollowLoaded(userId);
+        redisFollowService.ensureFansLoaded(userId);
     }
 }

@@ -55,10 +55,11 @@ public class UserFollowController {
         return Result.success(userFollowService.getFansList(currentUserId, cursor, pageSize));
     }
 
-    /** 冷启动：同步关注关系到 Redis */
+    /** 冷启动：同步当前用户的关注关系到 Redis */
     @PostMapping("/sync-to-redis")
     public Result<?> syncToRedis() {
-        userFollowService.syncFollowToRedis();
+        Long currentUserId = CurrentUserHolder.getUserId();
+        userFollowService.syncFollowToRedis(currentUserId);
         return Result.success("ok");
     }
 }
