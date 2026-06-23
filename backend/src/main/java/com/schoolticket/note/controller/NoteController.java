@@ -114,6 +114,13 @@ public class NoteController {
         return Result.success(noteCommentService.listComments(noteId, page, pageSize));
     }
 
+    @DeleteMapping("/{noteId}")
+    public Result<?> deleteNote(@PathVariable Long noteId) {
+        Long userId = requireUserId();
+        noteService.deleteNote(noteId, userId);
+        return Result.success(null);
+    }
+
     @DeleteMapping("/{noteId}/comment/{commentId}")
     public Result<?> deleteComment(@PathVariable Long noteId, @PathVariable Long commentId) {
         Long userId = requireUserId();

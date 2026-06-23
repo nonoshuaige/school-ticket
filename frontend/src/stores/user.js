@@ -5,10 +5,13 @@ import { logout as logoutApi } from '../api/auth'
 
 export const useUserStore = defineStore('user', () => {
   const userInfo = ref(null)
-  const isLoggedIn = ref(!!localStorage.getItem('isLoggedIn'))
+  const isLoggedIn = ref(!!localStorage.getItem('isLoggedIn') || !!localStorage.getItem('authToken'))
 
   async function login(phone, password) {
-    await loginApi({ phone, password })
+    const token = await loginApi({ phone, password })
+    if (token) {
+      localStorage.setItem('authToken', token)
+    }
     localStorage.setItem('isLoggedIn', 'true')
     isLoggedIn.value = true
     await fetchUserInfo()
@@ -23,10 +26,11 @@ export const useUserStore = defineStore('user', () => {
   }
 
   async function logout() {
-    try { await logoutApi() } catch {} 
+    try { await logoutApi() } catch {}
     userInfo.value = null
     isLoggedIn.value = false
     localStorage.removeItem('isLoggedIn')
+    localStorage.removeItem('authToken')
   }
 
   return { userInfo, isLoggedIn, login, fetchUserInfo, logout }

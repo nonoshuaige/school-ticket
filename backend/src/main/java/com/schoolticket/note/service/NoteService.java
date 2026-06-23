@@ -12,12 +12,15 @@ import com.schoolticket.user.mapper.UserMapper;
 import com.schoolticket.user.service.RedisFollowService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 @Service
@@ -31,6 +34,11 @@ public class NoteService {
     private final RedisFollowService redisFollowService;
     private final BloomFilterService bloomFilterService;
     private final RabbitTemplate rabbitTemplate;
+    private final StringRedisTemplate redis;
+
+    private static final String FEED_KEY = "feed:recommend:%d";
+    private static final int FEED_SNAPSHOT_SIZE = 200;
+    private static final int FEED_TTL_MINUTES = 30;
 
     // ==================== 游标分页查询（仅保留 latest / hottest） ====================
 
@@ -41,76 +49,87 @@ public class NoteService {
         return noteRankingService.getLatest(cursor, pageSize, currentUserId);
     }
 
-    // ==================== 推荐流（布隆过滤器消重 + 无限滚动） ====================
+    // ==================== 推荐流（快照拉取 — Session 级私有 Feed 队列） ====================
 
+    /**
+     * cursor == null → 下拉刷新：生成快照推入私有 List，LPOP 首页
+     * cursor != null → 上拉加载：LPOP 下一页
+     */
     public CursorPage<Map<String, Object>> recommendFeed(Long currentUserId, Long cursor, int pageSize) {
-        int offset = cursor != null ? cursor.intValue() : 0;
-        int windowSize = pageSize * 3; // 每页扫描窗口大小与 pageSize 成正比，保证多页可用
-
-        // Step 1: 从 ZSET offset 位置捞出窗口内的候选，随机取 pageSize 个
-        List<Long> candidates = noteRankingService.getCandidateIds(pageSize, offset, windowSize);
-        if (candidates.isEmpty()) return CursorPage.of(Collections.emptyList(), null, false, 0);
-
-        // Step 2: 布隆过滤器过滤已曝光
-        List<Long> fresh = new ArrayList<>();
         Long effectiveUserId = currentUserId != null ? currentUserId : 0L;
+        String feedKey = String.format(FEED_KEY, effectiveUserId);
+
+        if (cursor == null) {
+            // 下拉刷新：重新生成快照
+            List<Long> snapshot = generateFeedSnapshot(effectiveUserId);
+            redis.delete(feedKey);
+            if (!snapshot.isEmpty()) {
+                redis.opsForList().rightPushAll(feedKey, snapshot.stream().map(String::valueOf).toList());
+                redis.expire(feedKey, FEED_TTL_MINUTES, TimeUnit.MINUTES);
+            }
+        }
+
+        // 上拉加载 / 首页：从私有 List LPOP 取 pageSize 条
+        List<String> popped = new ArrayList<>();
+        for (int i = 0; i < pageSize; i++) {
+            String val = redis.opsForList().leftPop(feedKey);
+            if (val == null) break;
+            popped.add(val);
+        }
+
+        if (popped.isEmpty()) {
+            return CursorPage.of(Collections.emptyList(), null, false, 0);
+        }
+
+        List<Long> noteIds = popped.stream().map(Long::valueOf).collect(Collectors.toList());
+
+        // 标记已曝光
+        if (currentUserId != null) {
+            bloomFilterService.addAll(currentUserId, noteIds);
+        }
+
+        List<Map<String, Object>> records = assembleNoteVOsWithRepair(noteIds, currentUserId);
+
+        // 还有剩余 → hasMore，nextCursor 为信号值（非 null 即触发上拉加载）
+        Long remaining = redis.opsForList().size(feedKey);
+        boolean hasMore = remaining != null && remaining > 0;
+        return CursorPage.of(records, hasMore ? "0" : null, hasMore, records.size());
+    }
+
+    /** 从全站最新候选池中生成一个去重后的快照 ID 列表 */
+    private List<Long> generateFeedSnapshot(Long effectiveUserId) {
+        long total = noteRankingService.getLatestTotal();
+        if (total == 0) return Collections.emptyList();
+
+        // 取最新 600 条，shuffle 后过布隆，截取 FEED_SNAPSHOT_SIZE 条
+        int fetchSize = (int) Math.min(total, 600);
+        List<Long> candidates = noteRankingService.getCandidateIds(fetchSize, 0, fetchSize);
+        if (candidates.isEmpty()) return Collections.emptyList();
+
+        List<Long> fresh = new ArrayList<>();
         for (Long nid : candidates) {
             if (!bloomFilterService.mightContain(effectiveUserId, nid)) {
                 fresh.add(nid);
+                if (fresh.size() >= FEED_SNAPSHOT_SIZE) break;
             }
-            if (fresh.size() >= pageSize) break;
         }
-
-        // Step 3: 标记已曝光
-        if (currentUserId != null && !fresh.isEmpty()) {
-            bloomFilterService.addAll(currentUserId, fresh);
-        }
-
-        // Step 4: 组装 VO，nextCursor 指向下一窗口起点
-        List<Map<String, Object>> records = assembleNoteVOs(fresh, currentUserId);
-        int nextOffset = offset + windowSize;
-        long total = noteRankingService.getLatestTotal();
-        boolean hasMore = nextOffset < total;
-        return CursorPage.of(records, hasMore ? String.valueOf(nextOffset) : null, hasMore, records.size());
+        return fresh;
     }
 
-    // ==================== 关注流（拉模式时序聚合） ====================
+    // ==================== 关注流（推模式：读自己收件箱） ====================
 
     public CursorPage<Map<String, Object>> followingFeed(Long currentUserId, Long cursor, int pageSize) {
         if (currentUserId == null) return CursorPage.of(Collections.emptyList(), null, false, 0);
 
-        // Step 1: 获取关注的所有作者 ID
-        CursorPage<Map<String, Object>> followingPage = redisFollowService.getFollowing(currentUserId, null, Integer.MAX_VALUE);
-        List<Long> authorIds = followingPage.getRecords().stream()
-                .map(m -> (Long) m.get("userId"))
+        CursorPage<Map<String, Object>> inboxPage = noteRankingService.getFollowingFeedInbox(currentUserId, cursor, pageSize);
+        if (inboxPage.getRecords().isEmpty()) return inboxPage;
+
+        List<Long> noteIds = inboxPage.getRecords().stream()
+                .map(m -> (Long) m.get("noteId"))
                 .collect(Collectors.toList());
-        if (authorIds.isEmpty()) return CursorPage.of(Collections.emptyList(), null, false, 0);
 
-        // Step 2: 批量获取所有关注作者的 note:mine ZSET（每人最多取 50 条）
-        Set<Long> authorIdSet = new HashSet<>(authorIds);
-        Map<Long, Long> allNoteScores = noteRankingService.batchGetAuthorNoteIds(authorIdSet, 50);
-        if (allNoteScores.isEmpty()) return CursorPage.of(Collections.emptyList(), null, false, 0);
-
-        // Step 3: 按时间戳降序排序
-        List<Map.Entry<Long, Long>> sortedEntries = new ArrayList<>(allNoteScores.entrySet());
-        sortedEntries.sort((a, b) -> Long.compare(b.getValue(), a.getValue()));
-
-        // Step 4: 游标分页（cursor 为上一页最后一条的 score）
-        long cursorVal = cursor != null ? cursor : Long.MAX_VALUE;
-        List<Long> pageNoteIds = new ArrayList<>();
-        double lastScore = 0;
-        for (Map.Entry<Long, Long> entry : sortedEntries) {
-            if (entry.getValue() < cursorVal) {
-                pageNoteIds.add(entry.getKey());
-                lastScore = entry.getValue();
-                if (pageNoteIds.size() >= pageSize) break;
-            }
-        }
-
-        // Step 5: 组装 VO
-        List<Map<String, Object>> records = assembleNoteVOs(pageNoteIds, currentUserId);
-        boolean hasMore = pageNoteIds.size() >= pageSize;
-        return CursorPage.of(records, hasMore ? String.valueOf((long) lastScore) : null, hasMore, allNoteScores.size());
+        List<Map<String, Object>> records = assembleNoteVOsWithRepair(noteIds, currentUserId);
+        return CursorPage.of(records, inboxPage.getNextCursor(), inboxPage.isHasMore(), inboxPage.getTotal());
     }
 
     // ==================== 我的笔记（独立分页） ====================
@@ -128,17 +147,56 @@ public class NoteService {
         note.setContent(content);
         noteMapper.insert(note);
 
-        // 同步写入 Redis ZSET
+        // 1. 写入 VO 缓存
+        writeNoteVOToCache(note);
+
+        // 2. 同步写入 latest + mine ZSET
         noteRankingService.addNote(note);
 
-        // RabbitMQ 异步通知
+        // 3. 推模式：fanout 到所有粉丝收件箱
+        Set<Long> fanIds = redisFollowService.getFanIds(userId);
+        long timestamp = toEpochMilli(note.getCreateTime());
+        noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
+
+        // 4. MQ 异步兜底
         Map<String, Object> msg = new HashMap<>();
         msg.put("noteId", note.getNoteId());
         msg.put("userId", userId);
-        msg.put("createTime", toEpochMilli(note.getCreateTime()));
+        msg.put("createTime", timestamp);
+        msg.put("fanIds", fanIds.stream().map(String::valueOf).collect(Collectors.toList()));
         rabbitTemplate.convertAndSend("school.ticket.exchange", "note.create", msg);
 
         return note;
+    }
+
+    @Transactional
+    public void deleteNote(Long noteId, Long userId) {
+        Note note = noteMapper.selectById(noteId);
+        if (note == null) {
+            throw new BusinessException(400, "笔记不存在");
+        }
+        if (!note.getUserId().equals(userId)) {
+            throw new BusinessException(403, "只能删除自己的笔记");
+        }
+
+        // MyBatis-Plus @TableLogic: deleteById → UPDATE is_deleted = 1
+        noteMapper.deleteById(noteId);
+
+        // 清除 VO 缓存
+        noteRankingService.deleteNoteVO(noteId);
+
+        // 从所有粉丝收件箱移除
+        Set<Long> fanIds = redisFollowService.getFanIds(note.getUserId());
+        noteRankingService.removeFromFollowerInboxes(note.getUserId(), noteId, fanIds);
+
+        // 从全局 + mine ZSET 移除
+        noteRankingService.removeNote(note);
+
+        // RabbitMQ 异步兜底
+        Map<String, Object> msg = new HashMap<>();
+        msg.put("noteId", noteId);
+        msg.put("userId", note.getUserId());
+        rabbitTemplate.convertAndSend("school.ticket.exchange", "note.delete", msg);
     }
 
     public Map<String, Object> getNoteDetail(Long noteId, Long currentUserId) {
@@ -174,26 +232,26 @@ public class NoteService {
         return vo;
     }
 
-    // ==================== 点赞/取消 ====================
+    // ==================== 点赞/取消（Redis 先行） ====================
 
     @Transactional
     public void like(Long noteId, Long userId) {
-        Long count = noteLikeMapper.selectCount(
-                new LambdaQueryWrapper<NoteLike>()
-                        .eq(NoteLike::getNoteId, noteId)
-                        .eq(NoteLike::getUserId, userId));
-        if (count > 0) return;
-        NoteLike nl = new NoteLike();
-        nl.setNoteId(noteId);
-        nl.setUserId(userId);
-        noteLikeMapper.insert(nl);
-
-        // 更新 Redis hottest ZSET
-        long newCount = noteLikeMapper.selectCount(
-                new LambdaQueryWrapper<NoteLike>().eq(NoteLike::getNoteId, noteId));
+        // 1. Redis 先行
+        long newCount = noteRankingService.incrLikeCount(noteId);
+        noteRankingService.updateVOLikeCount(noteId, 1);
         noteRankingService.updateLikeCount(noteId, newCount);
 
-        // RabbitMQ 异步
+        // 2. MySQL 落库（唯一约束防并发重复）
+        try {
+            NoteLike nl = new NoteLike();
+            nl.setNoteId(noteId);
+            nl.setUserId(userId);
+            noteLikeMapper.insert(nl);
+        } catch (DuplicateKeyException e) {
+            // 幂等：已点过赞，不回滚 Redis
+        }
+
+        // 3. MQ
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", "like");
         msg.put("noteId", noteId);
@@ -203,83 +261,184 @@ public class NoteService {
 
     @Transactional
     public void unlike(Long noteId, Long userId) {
+        // 1. Redis 先行
+        noteRankingService.decrLikeCount(noteId);
+        noteRankingService.updateVOLikeCount(noteId, -1);
+
+        // 2. MySQL 删除
         noteLikeMapper.delete(
                 new LambdaQueryWrapper<NoteLike>()
                         .eq(NoteLike::getNoteId, noteId)
                         .eq(NoteLike::getUserId, userId));
 
-        noteRankingService.decrementLikeCount(noteId);
+        // 3. 用 MySQL 实际值校准 Redis（防止计数漂移）
+        long actualCount = noteLikeMapper.selectCount(
+                new LambdaQueryWrapper<NoteLike>().eq(NoteLike::getNoteId, noteId));
+        noteRankingService.setLikeCount(noteId, actualCount);
+        noteRankingService.updateLikeCount(noteId, actualCount);
 
+        // 4. MQ
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", "unlike");
         msg.put("noteId", noteId);
-        msg.put("likeCount", noteLikeMapper.selectCount(
-                new LambdaQueryWrapper<NoteLike>().eq(NoteLike::getNoteId, noteId)));
+        msg.put("likeCount", actualCount);
         rabbitTemplate.convertAndSend("school.ticket.exchange", "note.like", msg);
     }
 
     // ==================== 冷启动 ====================
 
-    /** 从 MySQL 同步全部数据到 Redis */
     public void syncAllToRedis() {
+        // 1. 同步 latest + mine ZSET
         noteRankingService.syncAllFromDB();
+
+        // 2. 同步点赞计数 + VO 缓存
         List<NoteLike> allLikes = noteLikeMapper.selectList(null);
         Map<Long, Long> likeCountMap = new HashMap<>();
         for (NoteLike lk : allLikes) {
             likeCountMap.merge(lk.getNoteId(), 1L, Long::sum);
         }
         noteRankingService.syncLikesFromDB(likeCountMap);
+
+        // 3. 回填 VO 缓存 + 点赞计数器 + 收件箱 fanout
+        List<Note> allNotes = noteMapper.selectList(null);
+        Set<Long> userIds = allNotes.stream().map(Note::getUserId).collect(Collectors.toSet());
+        Map<Long, User> userMap = new HashMap<>();
+        if (!userIds.isEmpty()) {
+            userMapper.selectBatchIds(userIds).forEach(u -> userMap.put(u.getUserId(), u));
+        }
+
+        // 构建作者 → 粉丝映射，一次性 fanout
+        Map<Long, Set<Long>> authorFanMap = new HashMap<>();
+
+        for (Note note : allNotes) {
+            long lc = likeCountMap.getOrDefault(note.getNoteId(), 0L);
+            noteRankingService.setLikeCount(note.getNoteId(), lc);
+
+            User author = userMap.get(note.getUserId());
+            Map<String, String> fields = new LinkedHashMap<>();
+            fields.put("content", note.getContent());
+            fields.put("userId", String.valueOf(note.getUserId()));
+            fields.put("nickname", author != null ? author.getNickname() : "");
+            fields.put("phone", author != null ? author.getPhone() : "");
+            fields.put("createTime", note.getCreateTime().toString());
+            fields.put("likeCount", String.valueOf(lc));
+            noteRankingService.cacheNoteVO(note.getNoteId(), fields);
+
+            // 批量 fanout 到粉丝收件箱（每个作者只查一次粉丝列表）
+            authorFanMap.computeIfAbsent(note.getUserId(),
+                    k -> redisFollowService.getFanIds(k));
+        }
+
+        // 执行 fanout
+        for (Note note : allNotes) {
+            Set<Long> fanIds = authorFanMap.getOrDefault(note.getUserId(), Collections.emptySet());
+            long timestamp = toEpochMilli(note.getCreateTime());
+            noteRankingService.fanoutToFollowers(note.getUserId(), note.getNoteId(), timestamp, fanIds);
+        }
     }
 
-    // ==================== VO 组装 ====================
+    // ==================== VO 组装（含读时修复 Read-Repair） ====================
 
-    private List<Map<String, Object>> assembleNoteVOs(List<Long> noteIds, Long currentUserId) {
+    /**
+     * 组装 VO：优先读 Redis VO 缓存，miss 查 MySQL 并回填。
+     * Read-Repair: selectBatchIds 中 @TableLogic 过滤掉的 ID 从 Redis 全局 ZSET 清除。
+     */
+    private List<Map<String, Object>> assembleNoteVOsWithRepair(List<Long> noteIds, Long currentUserId) {
         if (noteIds.isEmpty()) return Collections.emptyList();
 
-        List<Note> notes = noteMapper.selectBatchIds(noteIds);
-        Map<Long, Note> noteMap = notes.stream().collect(Collectors.toMap(Note::getNoteId, n -> n));
+        // 1. 优先从 Redis VO 缓存批量读
+        Map<Long, Map<String, String>> cachedVOs = noteRankingService.batchGetNoteVOs(noteIds);
 
-        Set<Long> userIds = notes.stream().map(Note::getUserId).collect(Collectors.toSet());
-        Map<Long, User> userMap = new HashMap<>();
-        if (!userIds.isEmpty())
-            userMapper.selectBatchIds(userIds).forEach(u -> userMap.put(u.getUserId(), u));
+        // 2. Cache miss 的 ID → MySQL 查 + 回填
+        List<Long> missIds = noteIds.stream()
+                .filter(nid -> !cachedVOs.containsKey(nid))
+                .collect(Collectors.toList());
 
-        Map<Long, Long> likeCountMap = new HashMap<>();
-        for (Long nid : noteIds) {
-            Double score = noteRankingService.getNoteHottestScore(nid);
-            if (score != null) likeCountMap.put(nid, score.longValue());
+        if (!missIds.isEmpty()) {
+            List<Note> notes = noteMapper.selectBatchIds(missIds);
+            Map<Long, Note> noteMap = notes.stream().collect(Collectors.toMap(Note::getNoteId, n -> n));
+
+            // Read-Repair: MySQL 中已不存在的 ID → 从 Redis 全局池清除
+            for (Long nid : missIds) {
+                if (!noteMap.containsKey(nid)) {
+                    noteRankingService.removeNoteFromGlobal(nid);
+                }
+            }
+
+            // 批量查用户信息
+            Set<Long> missUserIds = notes.stream().map(Note::getUserId).collect(Collectors.toSet());
+            Map<Long, User> missUserMap = new HashMap<>();
+            if (!missUserIds.isEmpty()) {
+                userMapper.selectBatchIds(missUserIds)
+                        .forEach(u -> missUserMap.put(u.getUserId(), u));
+            }
+
+            // 回填 VO 缓存
+            for (Note note : notes) {
+                User author = missUserMap.get(note.getUserId());
+                Map<String, String> fields = new LinkedHashMap<>();
+                fields.put("content", note.getContent());
+                fields.put("userId", String.valueOf(note.getUserId()));
+                fields.put("nickname", author != null ? author.getNickname() : "");
+                fields.put("phone", author != null ? author.getPhone() : "");
+                fields.put("createTime", note.getCreateTime().toString());
+
+                long likeCount = noteRankingService.getLikeCount(note.getNoteId());
+                if (likeCount < 0) {
+                    likeCount = noteLikeMapper.selectCount(
+                            new LambdaQueryWrapper<NoteLike>().eq(NoteLike::getNoteId, note.getNoteId()));
+                    noteRankingService.setLikeCount(note.getNoteId(), likeCount);
+                }
+                fields.put("likeCount", String.valueOf(likeCount));
+
+                noteRankingService.cacheNoteVO(note.getNoteId(), fields);
+                cachedVOs.put(note.getNoteId(), fields);
+            }
         }
 
+        // 3. 批量查当前用户点赞状态 (MySQL)
         Set<Long> likedSet = Collections.emptySet();
         if (currentUserId != null) {
-            likedSet = noteLikeMapper.selectList(
-                    new LambdaQueryWrapper<NoteLike>()
-                            .in(NoteLike::getNoteId, noteIds)
-                            .eq(NoteLike::getUserId, currentUserId))
-                    .stream()
-                    .map(NoteLike::getNoteId)
-                    .collect(Collectors.toSet());
+            List<Long> validIds = noteIds.stream().filter(cachedVOs::containsKey).collect(Collectors.toList());
+            if (!validIds.isEmpty()) {
+                likedSet = noteLikeMapper.selectList(
+                        new LambdaQueryWrapper<NoteLike>()
+                                .in(NoteLike::getNoteId, validIds)
+                                .eq(NoteLike::getUserId, currentUserId))
+                        .stream().map(NoteLike::getNoteId).collect(Collectors.toSet());
+            }
         }
 
+        // 4. 按原始顺序组装
         List<Map<String, Object>> records = new ArrayList<>();
         for (Long nid : noteIds) {
-            Note note = noteMap.get(nid);
-            if (note == null) continue;
+            Map<String, String> fields = cachedVOs.get(nid);
+            if (fields == null) continue;
+
             Map<String, Object> vo = new LinkedHashMap<>();
-            vo.put("noteId", note.getNoteId());
-            vo.put("content", note.getContent());
-            vo.put("createTime", note.getCreateTime());
-            vo.put("likeCount", likeCountMap.getOrDefault(nid, 0L));
+            vo.put("noteId", nid);
+            vo.put("content", fields.get("content"));
+            vo.put("createTime", fields.get("createTime"));
+            vo.put("likeCount", Long.parseLong(fields.getOrDefault("likeCount", "0")));
             vo.put("isLiked", likedSet.contains(nid));
-            User author = userMap.get(note.getUserId());
-            if (author != null) {
-                vo.put("userId", author.getUserId());
-                vo.put("nickname", author.getNickname());
-                vo.put("phone", author.getPhone());
-            }
+            vo.put("userId", Long.parseLong(fields.get("userId")));
+            vo.put("nickname", fields.get("nickname"));
+            vo.put("phone", fields.get("phone"));
             records.add(vo);
         }
         return records;
+    }
+
+    private void writeNoteVOToCache(Note note) {
+        User author = userMapper.selectById(note.getUserId());
+        Map<String, String> fields = new LinkedHashMap<>();
+        fields.put("content", note.getContent());
+        fields.put("userId", String.valueOf(note.getUserId()));
+        fields.put("nickname", author != null ? author.getNickname() : "");
+        fields.put("phone", author != null ? author.getPhone() : "");
+        fields.put("createTime", note.getCreateTime().toString());
+        fields.put("likeCount", "0");
+        noteRankingService.cacheNoteVO(note.getNoteId(), fields);
     }
 
     private static long toEpochMilli(LocalDateTime dt) {

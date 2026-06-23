@@ -1,7 +1,7 @@
 -- ============================================================
--- 校园活动票务系统 - 数据库初始化脚本 v3.0
+-- 校园活动票务系统 - 数据库初始化脚本 v3.3
 -- 数据库：school_ticket (utf8mb4)
--- 含 100 用户 / 15 活动 / 44 票档 / 200 笔记 / 关注+点赞
+-- 含 100 用户 / 15 活动 / 44 票档 / 200 笔记 / 关注+点赞 / 0 评论
 -- 测试账号：13800138000 / 123456
 -- ============================================================
 
@@ -124,6 +124,7 @@ CREATE TABLE `user_note` (
   `note_id`     BIGINT       NOT NULL AUTO_INCREMENT COMMENT '笔记ID',
   `user_id`     BIGINT       NOT NULL               COMMENT '作者用户ID',
   `content`     VARCHAR(500) NOT NULL               COMMENT '笔记内容',
+  `is_deleted`  TINYINT      DEFAULT 0              COMMENT '逻辑删除 0=正常 1=已删除',
   `create_time` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP COMMENT '创建时间',
   PRIMARY KEY (`note_id`),
   KEY `idx_user_id` (`user_id`),

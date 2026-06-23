@@ -1,6 +1,6 @@
 <template>
   <div class="mine-page">
-    <div class="user-header" v-if="userStore.userInfo">
+    <div class="user-header" v-if="userStore.isLoggedIn && userStore.userInfo">
       <div class="user-avatar">{{ (userStore.userInfo.nickname || 'U')[0] }}</div>
       <div class="user-meta">
         <div class="user-name">{{ userStore.userInfo.nickname }}</div>
@@ -13,6 +13,16 @@
       </div>
       <van-button size="small" plain hairline round color="#ffd700" @click="handleLogout"
         style="border-color:#ffd700;color:#ffd700;font-size:12px;min-width:70px">退出登录</van-button>
+    </div>
+
+    <div class="user-header" v-else>
+      <div class="user-avatar">?</div>
+      <div class="user-meta">
+        <div class="user-name">未登录</div>
+        <div class="user-phone">登录后可查看个人信息</div>
+      </div>
+      <van-button size="small" plain hairline round color="#ffd700" @click="$router.push('/login')"
+        style="border-color:#ffd700;color:#ffd700;font-size:12px;min-width:70px">登录</van-button>
     </div>
 
     <van-cell-group inset style="margin: 16px 12px; border-radius: 10px;">

@@ -5,9 +5,11 @@ import com.schoolticket.user.service.RedisFollowService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @Slf4j
 @Component
@@ -16,6 +18,10 @@ public class RedisSyncListener {
 
     private final RedisNoteRankingService noteRankingService;
     private final RedisFollowService followService;
+    private final StringRedisTemplate redis;
+
+    private static final String KEY_LATEST  = "note:latest";
+    private static final String KEY_MINE    = "note:mine:%d";
 
     /** 点赞事件 → 更新 hottest ZSET */
     @RabbitListener(queues = "#{noteLikeQueue.name}")
@@ -35,25 +41,44 @@ public class RedisSyncListener {
         }
     }
 
-    /** 创建笔记事件 → 加入 latest + mine ZSET */
+    /** 创建笔记事件 → 加入 latest + mine ZSET + fanout 到粉丝收件箱 */
     @RabbitListener(queues = "#{noteCreateQueue.name}")
     public void handleNoteCreate(Map<String, Object> msg) {
         try {
-            Long noteId    = ((Number) msg.get("noteId")).longValue();
-            Long userId    = ((Number) msg.get("userId")).longValue();
-            // 需要完整的 Note 对象，但我们用简化的方式：直接查 DB
-            var note = msg; // 在调用方已经设置了 createTime
-            // 这里通过简化方式: 直接操作 ZSET
-            long score = (long) msg.get("createTime");
-            // 注意: addNote 需要 Note 对象, 这里用原始方式
-            // 简化处理 - 直接用 redis template
+            Long noteId = ((Number) msg.get("noteId")).longValue();
+            Long userId = ((Number) msg.get("userId")).longValue();
+            long score  = ((Number) msg.get("createTime")).longValue();
+            redis.opsForZSet().add(KEY_LATEST, String.valueOf(noteId), score);
+            redis.opsForZSet().add(String.format(KEY_MINE, userId), String.valueOf(noteId), score);
+
+            // 异步 fanout 到粉丝收件箱
+            @SuppressWarnings("unchecked")
+            List<String> fanIdList = (List<String>) msg.get("fanIds");
+            if (fanIdList != null && !fanIdList.isEmpty()) {
+                Set<Long> fanIds = fanIdList.stream().map(Long::valueOf).collect(Collectors.toSet());
+                noteRankingService.fanoutToFollowers(userId, noteId, score, fanIds);
+            }
             log.info("Note create synced: noteId={} userId={}", noteId, userId);
         } catch (Exception e) {
             log.error("handleNoteCreate error", e);
         }
     }
 
-    /** 关注/取关事件 → 更新 follow/fan ZSET */
+    /** 删除笔记事件 → 从 latest + hottest + mine ZSET 清除 + VO 缓存 + 收件箱 */
+    @RabbitListener(queues = "#{noteDeleteQueue.name}")
+    public void handleNoteDelete(Map<String, Object> msg) {
+        try {
+            Long noteId = ((Number) msg.get("noteId")).longValue();
+            Long userId = msg.get("userId") != null ? ((Number) msg.get("userId")).longValue() : null;
+            noteRankingService.removeNoteById(noteId, userId);
+            noteRankingService.deleteNoteVO(noteId);
+            log.info("Note delete synced to Redis: noteId={} userId={}", noteId, userId);
+        } catch (Exception e) {
+            log.error("handleNoteDelete error", e);
+        }
+    }
+
+    /** 关注/取关事件 → 更新 follow/fan ZSET + 收件箱回填/清理 */
     @RabbitListener(queues = "#{followQueue.name}")
     public void handleFollow(Map<String, Object> msg) {
         try {
@@ -62,8 +87,12 @@ public class RedisSyncListener {
             Long userId       = ((Number) msg.get("userId")).longValue();
             if ("follow".equals(action)) {
                 followService.addFollow(followerId, userId);
+                // 关注时：回填被关注者最近笔记到新粉丝收件箱
+                noteRankingService.backfillInboxForNewFan(followerId, userId);
             } else if ("unfollow".equals(action)) {
                 followService.removeFollow(followerId, userId);
+                // 取关时：清理该用户笔记
+                noteRankingService.removeAuthorFromInbox(followerId, userId);
             }
             log.info("Follow synced to Redis: action={} follower={} user={}", action, followerId, userId);
         } catch (Exception e) {

@@ -11,6 +11,8 @@ public class Note {
     private Long noteId;
     private Long userId;
     private String content;
+    @TableLogic(value = "0", delval = "1")
+    private Integer isDeleted;
     @TableField(fill = FieldFill.INSERT)
     private LocalDateTime createTime;
 }

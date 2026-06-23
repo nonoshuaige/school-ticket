@@ -53,6 +53,13 @@ public class SecurityConfig {
                 .requestMatchers("/api/v1/**").authenticated()
                 .anyRequest().permitAll()
             )
+            .exceptionHandling(ex -> ex
+                .authenticationEntryPoint((req, res, e) -> {
+                    res.setContentType("application/json;charset=UTF-8");
+                    res.setStatus(401);
+                    res.getWriter().write("{\"code\":401,\"msg\":\"请先登录\",\"data\":null}");
+                })
+            )
             .addFilterBefore(jwtCookieFilter(), UsernamePasswordAuthenticationFilter.class);
         return http.build();
     }
@@ -66,7 +73,7 @@ public class SecurityConfig {
                                             FilterChain filterChain)
                     throws ServletException, IOException {
                 try {
-                    String token = extractTokenFromCookie(request);
+                    String token = extractToken(request);
                     if (token != null && jwtUtil.validateToken(token)) {
                         Long userId = jwtUtil.getUserIdFromToken(token);
                         CurrentUserHolder.setUserId(userId);
@@ -81,14 +88,21 @@ public class SecurityConfig {
                 }
             }
 
-            private String extractTokenFromCookie(HttpServletRequest request) {
+            private String extractToken(HttpServletRequest request) {
+                // 1. 优先从 Cookie 取
                 Cookie[] cookies = request.getCookies();
                 if (cookies != null) {
                     for (Cookie cookie : cookies) {
                         if (cookieName.equals(cookie.getName())) {
-                            return cookie.getValue();
+                            String val = cookie.getValue();
+                            if (val != null && !val.isEmpty()) return val;
                         }
                     }
+                }
+                // 2. 兜底从 Authorization header 取
+                String header = request.getHeader("Authorization");
+                if (header != null && header.startsWith("Bearer ")) {
+                    return header.substring(7);
                 }
                 return null;
             }

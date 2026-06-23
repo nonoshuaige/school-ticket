@@ -7,6 +7,15 @@ const request = axios.create({
   withCredentials: true
 })
 
+// 请求拦截器：附加 Authorization header 作为 cookie 的兜底
+request.interceptors.request.use((config) => {
+  const token = localStorage.getItem('authToken')
+  if (token) {
+    config.headers.Authorization = `Bearer ${token}`
+  }
+  return config
+})
+
 // 响应拦截器
 request.interceptors.response.use(
   (response) => {
@@ -20,10 +29,11 @@ request.interceptors.response.use(
   (error) => {
     if (error.response) {
       const status = error.response.status
-      if (status === 401) {
+      if (status === 401 || status === 403) {
         localStorage.removeItem('isLoggedIn')
-        window.location.href = '/#/login'
-        showToast('请先登录')
+        localStorage.removeItem('authToken')
+        location.replace('/#/login')
+        return Promise.reject(error)
       } else if (status === 500) {
         showToast('服务器错误')
       } else {

@@ -63,6 +63,13 @@ public class RedisFollowService {
         return size == null ? 0 : size;
     }
 
+    /** 获取全部粉丝 ID 集合（fanout 用） */
+    public Set<Long> getFanIds(Long userId) {
+        Set<String> members = redis.opsForZSet().range(String.format(FANS_KEY, userId), 0, -1);
+        if (members == null || members.isEmpty()) return Collections.emptySet();
+        return members.stream().map(Long::valueOf).collect(Collectors.toSet());
+    }
+
     /** 批量获取关注时间（返回 followeeId → followTime） */
     public Map<Long, Long> getFollowTimes(Long followerId, Set<Long> userIds) {
         Map<Long, Long> result = new HashMap<>();
