@@ -35,7 +35,10 @@
             <span class="order-time">{{ formatDateTime(item.createTime) }}</span>
           </div>
           <div class="order-actions" v-if="item.status === 0" @click.stop>
-            <van-button size="mini" type="primary" @click="payNow(item)">去支付</van-button>
+            <span class="countdown-label" :class="{ expired: countdownInfo(item.expireTime).expired }">
+              {{ countdownInfo(item.expireTime).text }}
+            </span>
+            <van-button size="mini" type="primary" :disabled="countdownInfo(item.expireTime).expired" @click="payNow(item)">去支付</van-button>
             <van-button size="mini" plain @click="cancelNow(item)">取消</van-button>
           </div>
         </div>
@@ -59,7 +62,7 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
 import { getOrderList, payOrder, cancelOrder } from '../api/order'
@@ -89,7 +92,17 @@ function buildParams() {
   return params
 }
 
-onMounted(() => { loadOrders() })
+const now = ref(Date.now())
+let timer = null
+
+onMounted(() => {
+  loadOrders()
+  timer = setInterval(() => { now.value = Date.now() }, 1000)
+})
+
+onUnmounted(() => {
+  clearInterval(timer)
+})
 
 async function loadOrders() {
   loading.value = true
@@ -117,11 +130,24 @@ function statusLabel(item) {
   return orderStatusText(item.status)
 }
 
+function countdownInfo(expireTime) {
+  if (!expireTime) return { text: '', expired: false }
+  const diff = new Date(expireTime).getTime() - now.value
+  if (diff <= 0) return { text: '已过期', expired: true }
+  const min = Math.floor(diff / 60000)
+  const sec = Math.floor((diff % 60000) / 1000)
+  return { text: `${String(min).padStart(2, '0')}:${String(sec).padStart(2, '0')}`, expired: false }
+}
+
 function goToDetail(item) {
   router.push(`/mine/detail/${item.orderNo}`)
 }
 
 async function payNow(item) {
+  if (countdownInfo(item.expireTime).expired) {
+    showToast('订单已过期')
+    return
+  }
   try {
     await payOrder(item.orderNo)
     showToast('支付成功')
@@ -156,6 +182,8 @@ async function cancelNow(item) {
 .order-time { font-size: 11px; color: #999; }
 .order-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 8px; padding-top: 8px; border-top: 1px solid #f5f5f5; }
 .order-actions .van-button { font-size: 12px; height: 28px; line-height: 28px; }
+.countdown-label { font-size: 12px; color: #f57c00; white-space: nowrap; }
+.countdown-label.expired { color: #999; }
 .empty-state { text-align: center; padding: 80px 0; }
 .empty-state p { color: #999; margin: 8px 0; }
 </style>

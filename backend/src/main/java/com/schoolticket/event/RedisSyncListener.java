@@ -23,24 +23,6 @@ public class RedisSyncListener {
     private static final String KEY_LATEST  = "note:latest";
     private static final String KEY_MINE    = "note:mine:%d";
 
-    /** 点赞事件 → 更新 hottest ZSET */
-    @RabbitListener(queues = "#{noteLikeQueue.name}")
-    public void handleNoteLike(Map<String, Object> msg) {
-        try {
-            String action = (String) msg.get("action");
-            Long noteId  = ((Number) msg.get("noteId")).longValue();
-            Long likeCount = msg.get("likeCount") != null ? ((Number) msg.get("likeCount")).longValue() : 0;
-            if ("like".equals(action)) {
-                noteRankingService.updateLikeCount(noteId, likeCount);
-            } else if ("unlike".equals(action)) {
-                noteRankingService.decrementLikeCount(noteId);
-            }
-            log.info("Redis hottest synced: action={} noteId={}", action, noteId);
-        } catch (Exception e) {
-            log.error("handleNoteLike error", e);
-        }
-    }
-
     /** 创建笔记事件 → 加入 latest + mine ZSET + fanout 到粉丝收件箱 */
     @RabbitListener(queues = "#{noteCreateQueue.name}")
     public void handleNoteCreate(Map<String, Object> msg) {
@@ -64,7 +46,7 @@ public class RedisSyncListener {
         }
     }
 
-    /** 删除笔记事件 → 从 latest + hottest + mine ZSET 清除 + VO 缓存 + 收件箱 */
+    /** 删除笔记事件 → 从 latest + mine ZSET 清除 + VO 缓存 + 收件箱 */
     @RabbitListener(queues = "#{noteDeleteQueue.name}")
     public void handleNoteDelete(Map<String, Object> msg) {
         try {

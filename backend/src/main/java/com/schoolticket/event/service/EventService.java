@@ -9,13 +9,18 @@ import com.schoolticket.event.mapper.EventMapper;
 import com.schoolticket.event.mapper.TicketCategoryMapper;
 import com.schoolticket.order.entity.Order;
 import com.schoolticket.order.mapper.OrderMapper;
+import com.schoolticket.order.service.OrderLuaService;
 import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 
+import jakarta.annotation.PostConstruct;
 import java.math.BigDecimal;
+import java.time.ZoneId;
 import java.util.*;
 import java.util.stream.Collectors;
 
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class EventService {
@@ -23,6 +28,7 @@ public class EventService {
     private final EventMapper eventMapper;
     private final TicketCategoryMapper ticketCategoryMapper;
     private final OrderMapper orderMapper;
+    private final OrderLuaService orderLuaService;
 
     public IPage<Event> getEventList(Integer status, Integer page, Integer pageSize) {
         LambdaQueryWrapper<Event> wrapper = new LambdaQueryWrapper<Event>()
@@ -100,5 +106,30 @@ public class EventService {
             result.put("purchasedQuantity", totalQty);
         }
         return result;
+    }
+
+    /**
+     * 启动时预热：将热卖中活动的票档库存同步到 Redis
+     */
+    @PostConstruct
+    public void preloadStock() {
+        try {
+            List<Event> hotEvents = eventMapper.selectList(
+                    new LambdaQueryWrapper<Event>().eq(Event::getStatus, 1));
+            int count = 0;
+            for (Event event : hotEvents) {
+                long expireAtSec = event.getSaleEndTime()
+                        .atZone(ZoneId.of("Asia/Shanghai")).toEpochSecond();
+                List<TicketCategory> tickets = ticketCategoryMapper.selectList(
+                        new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, event.getEventId()));
+                for (TicketCategory ticket : tickets) {
+                    orderLuaService.setStock(ticket.getTicketId(), ticket.getRemainingQuantity(), expireAtSec);
+                    count++;
+                }
+            }
+            log.info("库存预热完成: {} 个票档 ({} 个热卖活动)", count, hotEvents.size());
+        } catch (Exception e) {
+            log.error("库存预热失败", e);
+        }
     }
 }

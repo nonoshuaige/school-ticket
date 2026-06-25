@@ -13,6 +13,7 @@ const routes = [
   { path: '/order/pay', name: 'OrderPay', component: () => import('../views/OrderPay.vue'), meta: { requiresAuth: true } },
   { path: '/order/result', name: 'OrderResult', component: () => import('../views/OrderResult.vue') },
 
+  { path: '/agent', name: 'AgentChat', component: () => import('../views/AgentChat.vue') },
   { path: '/mine', name: 'Mine', component: () => import('../views/Mine.vue') },
   { path: '/mine/orders', name: 'MyOrders', component: () => import('../views/MyOrders.vue'), meta: { requiresAuth: true } },
   { path: '/mine/notes', name: 'MyNotes', component: () => import('../views/MyNotes.vue'), meta: { requiresAuth: true } },

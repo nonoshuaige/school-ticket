@@ -28,7 +28,6 @@ public class RedisNoteRankingService {
     private final NoteLikeMapper noteLikeMapper;
 
     private static final String KEY_LATEST  = "note:latest";
-    private static final String KEY_HOTTEST = "note:hottest";
     private static final String KEY_MINE    = "note:mine:%d";
     private static final String FEED_FOLLOWING_KEY = "feed:following:%d";
     private static final String VO_KEY       = "note:vo:%d";
@@ -37,7 +36,6 @@ public class RedisNoteRankingService {
     private static final int    FEED_FOLLOWING_CAP = 800;
     private static final long   VO_TTL_SECONDS = 7 * 24 * 3600;
     private static final long   LATEST_TTL_SECONDS = 86400;
-    private static final long   HOTTEST_TTL_SECONDS = 86400;
     private static final long   MINE_TTL_SECONDS = 259200;
     private static final long   LIKE_COUNT_TTL_SECONDS = 604800;
     private static final long   USER_LIKES_TTL_SECONDS = 259200;
@@ -55,25 +53,6 @@ public class RedisNoteRankingService {
         redis.expire(mineKey, MINE_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
-    /** 点赞时更新 hottest ZSET */
-    public void updateLikeCount(Long noteId, long likeCount) {
-        if (likeCount > 0) {
-            redis.opsForZSet().add(KEY_HOTTEST, String.valueOf(noteId), likeCount);
-        } else {
-            redis.opsForZSet().remove(KEY_HOTTEST, String.valueOf(noteId));
-        }
-        redis.expire(KEY_HOTTEST, HOTTEST_TTL_SECONDS, TimeUnit.SECONDS);
-    }
-
-    /** 取消点赞时降低热度分 */
-    public void decrementLikeCount(Long noteId) {
-        Double score = redis.opsForZSet().score(KEY_HOTTEST, String.valueOf(noteId));
-        if (score != null && score > 0) {
-            redis.opsForZSet().incrementScore(KEY_HOTTEST, String.valueOf(noteId), -1);
-        }
-        redis.expire(KEY_HOTTEST, HOTTEST_TTL_SECONDS, TimeUnit.SECONDS);
-    }
-
     /** 删除笔记时从所有 ZSET 移除 */
     public void removeNote(Note note) {
         removeNoteById(note.getNoteId(), note.getUserId());
@@ -82,16 +61,14 @@ public class RedisNoteRankingService {
     /** 根据 noteId + userId 从所有 ZSET 移除（MQ 消费端 / 读时修复使用） */
     public void removeNoteById(Long noteId, Long userId) {
         redis.opsForZSet().remove(KEY_LATEST, String.valueOf(noteId));
-        redis.opsForZSet().remove(KEY_HOTTEST, String.valueOf(noteId));
         if (userId != null) {
             redis.opsForZSet().remove(String.format(KEY_MINE, userId), String.valueOf(noteId));
         }
     }
 
-    /** 仅从 latest + hottest ZSET 移除（读时修复使用，userId 未知时降级处理） */
+    /** 从 latest ZSET 移除（读时修复使用，userId 未知时降级处理） */
     public void removeNoteFromGlobal(Long noteId) {
         redis.opsForZSet().remove(KEY_LATEST, String.valueOf(noteId));
-        redis.opsForZSet().remove(KEY_HOTTEST, String.valueOf(noteId));
     }
 
     // ==================== 推模式：关注流收件箱 ====================
@@ -314,24 +291,11 @@ public class RedisNoteRankingService {
 
     // ==================== 游标分页查询 ====================
 
-    public CursorPage<Map<String, Object>> getLatest(Long cursor, int pageSize, Long currentUserId) {
-        return queryNotePage(KEY_LATEST, cursor, pageSize, currentUserId);
-    }
-
-    public CursorPage<Map<String, Object>> getHottest(Long cursor, int pageSize, Long currentUserId) {
-        return queryNotePage(KEY_HOTTEST, cursor, pageSize, currentUserId);
-    }
-
     public CursorPage<Map<String, Object>> getMine(Long userId, Long cursor, int pageSize, Long currentUserId) {
         return queryNotePage(String.format(KEY_MINE, userId), cursor, pageSize, currentUserId);
     }
 
-    /** 查询单个 noteId 在 hottest ZSET 中的得分 */
-    public Double getNoteHottestScore(Long noteId) {
-        return redis.opsForZSet().score(KEY_HOTTEST, String.valueOf(noteId));
-    }
-
-    /** 冷启动：从数据库同步全局池（latest + hottest），不再同步用户级数据 */
+    /** 冷启动：从数据库同步最新候选池，不再同步用户级数据 */
     public void syncAllFromDB() {
         List<Note> allNotes = noteMapper.selectList(null);
         for (Note note : allNotes) {
@@ -339,16 +303,6 @@ public class RedisNoteRankingService {
             redis.opsForZSet().add(KEY_LATEST, String.valueOf(note.getNoteId()), score);
         }
         redis.expire(KEY_LATEST, LATEST_TTL_SECONDS, TimeUnit.SECONDS);
-    }
-
-    /** 冷启动：同步点赞数据到 hottest ZSET */
-    public void syncLikesFromDB(Map<Long, Long> likeCountMap) {
-        for (Map.Entry<Long, Long> entry : likeCountMap.entrySet()) {
-            if (entry.getValue() > 0) {
-                redis.opsForZSet().add(KEY_HOTTEST, String.valueOf(entry.getKey()), entry.getValue());
-            }
-        }
-        redis.expire(KEY_HOTTEST, HOTTEST_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
     // ==================== 懒加载：按用户按需加载 ====================
@@ -505,11 +459,11 @@ public class RedisNoteRankingService {
         if (!userIds.isEmpty())
             userMapper.selectBatchIds(userIds).forEach(u -> userMap.put(u.getUserId(), u));
 
-        // 查点赞数 (从 hottest ZSET 获取)
+        // 查点赞数 (从 like:count 获取)
         Map<Long, Long> likeCountMap = new HashMap<>();
         for (Long nid : noteIds) {
-            Double score = redis.opsForZSet().score(KEY_HOTTEST, String.valueOf(nid));
-            if (score != null) likeCountMap.put(nid, score.longValue());
+            long count = getLikeCount(nid);
+            if (count >= 0) likeCountMap.put(nid, count);
         }
 
         // 查当前用户是否点赞 (Redis Set)

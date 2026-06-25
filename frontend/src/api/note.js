@@ -1,9 +1,5 @@
 import request from '../utils/request'
 
-export function getNoteList(params) {
-  return request.get('/note/list', { params })
-}
-
 export function getRecommendFeed(params) {
   return request.get('/note/recommend-feed', { params })
 }

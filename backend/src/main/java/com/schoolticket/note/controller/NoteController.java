@@ -18,15 +18,6 @@ public class NoteController {
     private final NoteService noteService;
     private final NoteCommentService noteCommentService;
 
-    /** 笔记列表 - 游标分页（保留 latest / hottest，已移除 mine） */
-    @GetMapping("/list")
-    public Result<?> list(@RequestParam(required = false) Long cursor,
-                          @RequestParam(defaultValue = "20") Integer pageSize,
-                          @RequestParam(defaultValue = "latest") String sort) {
-        Long userId = tryGetUserId();
-        return Result.success(noteService.listNotes(cursor, pageSize, userId, sort));
-    }
-
     /** 推荐流 - 布隆过滤器消重 + 游标翻页 */
     @GetMapping("/recommend-feed")
     public Result<?> recommendFeed(@RequestParam(required = false) Long cursor,

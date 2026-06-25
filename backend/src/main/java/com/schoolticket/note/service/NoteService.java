@@ -42,15 +42,6 @@ public class NoteService {
     private static final int FEED_SNAPSHOT_SIZE = 200;
     private static final int FEED_TTL_MINUTES = 30;
 
-    // ==================== 游标分页查询（仅保留 latest / hottest） ====================
-
-    public CursorPage<Map<String, Object>> listNotes(Long cursor, int pageSize, Long currentUserId, String sort) {
-        if ("hottest".equals(sort)) {
-            return noteRankingService.getHottest(cursor, pageSize, currentUserId);
-        }
-        return noteRankingService.getLatest(cursor, pageSize, currentUserId);
-    }
-
     // ==================== 推荐流（快照拉取 — Session 级私有 Feed 队列） ====================
 
     /**
@@ -279,7 +270,6 @@ public class NoteService {
         long newCount = noteRankingService.incrLikeCount(noteId);
         noteRankingService.saddUserLike(userId, noteId);
         noteRankingService.updateVOLikeCount(noteId, 1);
-        noteRankingService.updateLikeCount(noteId, newCount);
 
         // 2. MySQL 落库（唯一约束防并发重复）
         try {
@@ -290,13 +280,6 @@ public class NoteService {
         } catch (DuplicateKeyException e) {
             // 幂等：已点过赞，不回滚 Redis
         }
-
-        // 3. MQ
-        Map<String, Object> msg = new HashMap<>();
-        msg.put("action", "like");
-        msg.put("noteId", noteId);
-        msg.put("likeCount", newCount);
-        rabbitTemplate.convertAndSend("school.ticket.exchange", "note.like", msg);
     }
 
     @Transactional
@@ -316,32 +299,21 @@ public class NoteService {
         long actualCount = noteLikeMapper.selectCount(
                 new LambdaQueryWrapper<NoteLike>().eq(NoteLike::getNoteId, noteId));
         noteRankingService.setLikeCount(noteId, actualCount);
-        noteRankingService.updateLikeCount(noteId, actualCount);
-
-        // 4. MQ
-        Map<String, Object> msg = new HashMap<>();
-        msg.put("action", "unlike");
-        msg.put("noteId", noteId);
-        msg.put("likeCount", actualCount);
-        rabbitTemplate.convertAndSend("school.ticket.exchange", "note.like", msg);
     }
 
     // ==================== 冷启动 ====================
 
-    /** 冷启动：仅同步全局池（latest + hottest + 点赞计数器），用户级数据由懒加载按需构建 */
+    /** 冷启动：仅同步全局候选池 + 点赞计数器，用户级数据由懒加载按需构建 */
     public void syncAllToRedis() {
-        // 1. 同步 latest + hottest 全局 ZSET
+        // 1. 同步 latest 全局候选池
         noteRankingService.syncAllFromDB();
 
-        // 2. 同步点赞计数到 hottest ZSET
+        // 2. 同步点赞计数器（note:like:count:{noteId}）
         List<NoteLike> allLikes = noteLikeMapper.selectList(null);
         Map<Long, Long> likeCountMap = new HashMap<>();
         for (NoteLike lk : allLikes) {
             likeCountMap.merge(lk.getNoteId(), 1L, Long::sum);
         }
-        noteRankingService.syncLikesFromDB(likeCountMap);
-
-        // 3. 同步点赞计数器（note:like:count:{noteId}）
         for (Map.Entry<Long, Long> entry : likeCountMap.entrySet()) {
             noteRankingService.setLikeCount(entry.getKey(), entry.getValue());
         }

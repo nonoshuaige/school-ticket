@@ -12,15 +12,18 @@ import com.schoolticket.event.entity.Event;
 import com.schoolticket.event.entity.TicketCategory;
 import com.schoolticket.event.mapper.EventMapper;
 import com.schoolticket.event.mapper.TicketCategoryMapper;
+import com.schoolticket.order.cache.SoldOutCache;
 import com.schoolticket.order.entity.Order;
 import com.schoolticket.order.mapper.OrderMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.LocalDateTime;
+import java.time.ZoneId;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -35,46 +38,78 @@ public class OrderService {
     private final OrderMapper orderMapper;
     private final TicketCategoryMapper ticketCategoryMapper;
     private final EventMapper eventMapper;
+    private final OrderLuaService orderLuaService;
+    private final SoldOutCache soldOutCache;
+
+    private static final int EXPIRE_MINUTES = 15;
 
     // ===================== 核心履约 =====================
 
     /**
-     * 创建订单（名额扣减）
-     * 每次购买独立生成订单，不合并
+     * 创建订单（Redis Lua 原子扣库存 + 本地售罄缓存 + Stream 异步落库）
      */
     @Transactional
     public Order createOrder(Long userId, OrderCreateReq req) {
-        // 1. 悲观锁锁定票档行
-        TicketCategory ticket = ticketCategoryMapper.selectForUpdate(req.getTicketId());
+        // 1. 本地售罄缓存短路
+        if (soldOutCache.isSoldOut(req.getTicketId())) {
+            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+        }
+
+        // 2. 查票档信息（无锁 selectById）
+        TicketCategory ticket = ticketCategoryMapper.selectById(req.getTicketId());
         if (ticket == null) {
             throw new BusinessException(BusinessException.INVALID_PARAM, "票档不存在");
         }
 
-        // 2. 检查用户购买限制：每活动每类票最多5张，且只能买一类
-        checkPurchaseLimit(userId, ticket.getEventId(), req.getTicketId(), req.getQuantity());
-
-        // 3. 校验本次购买数量不超过余量
-        if (ticket.getRemainingQuantity() < req.getQuantity()) {
-            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "余票不足");
+        Event event = eventMapper.selectById(ticket.getEventId());
+        if (event == null) {
+            throw new BusinessException(BusinessException.INVALID_PARAM, "活动不存在");
         }
 
-        // 4. 扣减名额
-        ticket.setRemainingQuantity(ticket.getRemainingQuantity() - req.getQuantity());
-        ticketCategoryMapper.updateById(ticket);
+        // 3. 预生成订单号
+        String orderNo = IdUtil.getSnowflakeNextIdStr();
+        BigDecimal totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
+        long expireTimeMs = LocalDateTime.now().plusMinutes(EXPIRE_MINUTES)
+                .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
 
-        // 5. 创建订单（每次独立，不合并）
+        // 4. 查该活动所有票档 ID（跨票档检查用）
+        List<Long> allTicketIds = ticketCategoryMapper.selectList(
+                new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, event.getEventId()))
+                .stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
+
+        // 5. 执行 Lua 脚本（原子：售罄检查 + 库存扣减 + 限购 + 跨票档 + Stream 写入）
+        List<Object> result = orderLuaService.executePurchase(
+                req.getTicketId(), userId, event.getEventId(), orderNo,
+                req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs,
+                allTicketIds);
+
+        long code = result.get(0) instanceof Long ? (Long) result.get(0)
+                : ((Number) result.get(0)).longValue();
+
+        if (code == -1 || code == -2) {
+            soldOutCache.markSoldOut(req.getTicketId());
+            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+        }
+        if (code == -3) {
+            throw new BusinessException("该票档最多购买5张");
+        }
+        if (code == -4) {
+            throw new BusinessException("该活动您已购买其他票档，每个活动只能购买一类票");
+        }
+
+        // 6. 直接落库（前端需立即获取订单数据；Stream 消费者做幂等兜底）
         Order order = new Order();
-        order.setOrderNo(IdUtil.getSnowflakeNextIdStr());
+        order.setOrderNo(orderNo);
         order.setUserId(userId);
         order.setTicketId(req.getTicketId());
         order.setQuantity(req.getQuantity());
-        order.setTotalPrice(ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity())));
+        order.setTotalPrice(totalPrice);
         order.setStatus(0);
-        order.setExpireTime(LocalDateTime.now().plusMinutes(15));
+        order.setExpireTime(LocalDateTime.now().plusMinutes(EXPIRE_MINUTES));
         orderMapper.insert(order);
 
         log.info("订单创建: orderNo={}, userId={}, ticketId={}, qty={}",
-                order.getOrderNo(), userId, req.getTicketId(), req.getQuantity());
+                orderNo, userId, req.getTicketId(), req.getQuantity());
         return order;
     }
 
@@ -96,7 +131,7 @@ public class OrderService {
     }
 
     /**
-     * 主动取消（未支付）
+     * 主动取消（未支付）→ DB 回滚 + Lua 回滚库存
      */
     @Transactional
     public Order cancelOrder(String orderNo) {
@@ -106,12 +141,17 @@ public class OrderService {
         order.setStatus(2);
         order.setCancelTime(LocalDateTime.now());
         orderMapper.updateById(order);
+
+        // Lua 回滚 Redis 库存 + 售罄标记
+        rollbackRedis(order);
+
+        soldOutCache.invalidate(order.getTicketId());
         log.info("订单取消: orderNo={}", orderNo);
         return order;
     }
 
     /**
-     * 退款（已支付 → 退款）
+     * 退款（已支付 → 退款）→ DB 回滚 + Lua 回滚库存
      */
     @Transactional
     public Order refundOrder(String orderNo) {
@@ -121,6 +161,10 @@ public class OrderService {
         order.setStatus(3);
         order.setRefundTime(LocalDateTime.now());
         orderMapper.updateById(order);
+
+        rollbackRedis(order);
+
+        soldOutCache.invalidate(order.getTicketId());
         log.info("订单退款: orderNo={}", orderNo);
         return order;
     }
@@ -142,7 +186,6 @@ public class OrderService {
     // ===================== 查询 =====================
 
     public IPage<EventOrderGroupVO> listOrders(Long userId, Integer pageNum, Integer pageSize, Integer status) {
-        // 1. 查全量订单，按创建时间倒序
         LambdaQueryWrapper<Order> wrapper = new LambdaQueryWrapper<Order>()
                 .eq(Order::getUserId, userId);
         if (status != null) {
@@ -151,7 +194,6 @@ public class OrderService {
         wrapper.orderByDesc(Order::getCreateTime);
         List<Order> allOrders = orderMapper.selectList(wrapper);
 
-        // 2. 转VO并按eventId分组（保持首次出现顺序）
         Map<Long, EventOrderGroupVO> groupMap = new LinkedHashMap<>();
         for (Order order : allOrders) {
             OrderVO vo = convertToVO(order);
@@ -167,7 +209,6 @@ public class OrderService {
             group.getOrders().add(vo);
         }
 
-        // 3. 对分组做内存分页
         List<EventOrderGroupVO> allGroups = new ArrayList<>(groupMap.values());
         int total = allGroups.size();
         int from = (pageNum - 1) * pageSize;
@@ -202,40 +243,7 @@ public class OrderService {
     }
 
     /**
-     * 检查用户购买限制：每个活动只能买一类票，每类票最多5张
-     */
-    private void checkPurchaseLimit(Long userId, Long eventId, Long ticketId, int quantity) {
-        List<TicketCategory> allTickets = ticketCategoryMapper.selectList(
-                new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, eventId));
-        List<Long> ticketIds = allTickets.stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
-
-        // 查询用户在该活动下所有有效订单（排除已取消和已退款）
-        List<Order> existingOrders = orderMapper.selectList(
-                new LambdaQueryWrapper<Order>()
-                        .eq(Order::getUserId, userId)
-                        .in(Order::getTicketId, ticketIds)
-                        .notIn(Order::getStatus, 2, 3));
-
-        // 检查是否已购买其他票档
-        long differentCategoryCount = existingOrders.stream()
-                .filter(o -> !o.getTicketId().equals(ticketId))
-                .count();
-        if (differentCategoryCount > 0) {
-            throw new BusinessException("该活动您已购买其他票档，每个活动只能购买一类票");
-        }
-
-        // 检查累计购买数量
-        int totalPurchased = existingOrders.stream()
-                .filter(o -> o.getTicketId().equals(ticketId))
-                .mapToInt(Order::getQuantity)
-                .sum();
-        if (totalPurchased + quantity > 5) {
-            throw new BusinessException("该票档最多购买5张，您已购买" + totalPurchased + "张，还可购买" + (5 - totalPurchased) + "张");
-        }
-    }
-
-    /**
-     * 回补票档名额（取消/退票时调用）
+     * 回补票档名额（MySQL 层面）
      */
     private void replenishTicket(Order order) {
         TicketCategory ticket = ticketCategoryMapper.selectById(order.getTicketId());
@@ -243,6 +251,14 @@ public class OrderService {
             ticket.setRemainingQuantity(ticket.getRemainingQuantity() + order.getQuantity());
             ticketCategoryMapper.updateById(ticket);
         }
+    }
+
+    /**
+     * Lua 回滚 Redis 库存 + 售罄标记 + 用户购买记录
+     */
+    private void rollbackRedis(Order order) {
+        orderLuaService.executeRollback(
+                order.getTicketId(), order.getUserId(), order.getQuantity());
     }
 
     /**
@@ -279,7 +295,7 @@ public class OrderService {
 
     /**
      * 超时关单 —— 由 OrderTimeoutTask 调用
-     * 对单个订单执行关单（含回补）
+     * DB 回滚 + Redis 回滚
      */
     @Transactional
     public void expireOrder(Order order) {
@@ -287,6 +303,10 @@ public class OrderService {
         order.setStatus(2);
         order.setCancelTime(LocalDateTime.now());
         orderMapper.updateById(order);
+
+        rollbackRedis(order);
+        soldOutCache.invalidate(order.getTicketId());
+
         log.info("超时关单: orderNo={}", order.getOrderNo());
     }
 }

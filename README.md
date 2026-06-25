@@ -15,7 +15,7 @@
 
 ## 技术栈
 
-**后端**：Java 21 · Spring Boot 3.2.5 · Spring Security · MyBatis-Plus 3.5.7 · MySQL 8.0 · Redis 7.4 (ZSET) · RabbitMQ 3.13 · JWT
+**后端**：Java 21 · Spring Boot 3.2.5 · Spring Security · MyBatis-Plus 3.5.7 · MySQL 8.0 · Redis 7.4 (ZSET + Stream + Lua) · RabbitMQ 3.13 · Caffeine · JWT
 
 **前端**：Vue 3 (Composition API) · Vite 5 · Pinia · Axios · Vant 4
 
@@ -88,7 +88,10 @@ npm run dev
 │       ├── auth/                     # 认证：登录/注册/JWT
 │       ├── user/                     # 用户 + 关注/粉丝（Redis ZSET 游标分页）
 │       ├── event/                    # 活动 + 票档 + 最低票价
-│       ├── order/                    # 订单：创建/支付/取消/退款/超时关单
+│       ├── order/                    # 订单：Lua 抢购 / 支付 / 取消 / 退款 / 超时关单 / Stream 消费
+│       │   ├── cache/SoldOutCache.java   # Caffeine 本地售罄缓存
+│       │   ├── consumer/OrderStreamConsumer.java  # Redis Stream 异步落库
+│       │   └── service/OrderLuaService.java       # Lua 脚本执行 + 库存预热
 │       ├── note/                     # 笔记 + 点赞 + 评论 + Redis ZSET 排行
 │       ├── config/                   # Security / MyBatis-Plus / Redis / RabbitMQ
 │       └── dto/                      # CursorPage / CommentVO 等
@@ -112,6 +115,7 @@ npm run dev
 - **Redis 先行点赞 + 用户点赞 Set**：`note:like:count:{noteId}` String 计数器 INCR/DECR 先行（7天 TTL）+ `user:likes:{userId}` Set 记录谁点了赞（3天 TTL），O(1) SISMEMBER 判赞替代 MySQL 查询，MySQL 异步落库兜底
 - **按用户懒加载 + TTL 过期**：冷启动仅同步 `note:latest` / `note:hottest` 全局池（1天 TTL），用户级数据（关注/粉丝 3天、收件箱 3天、点赞 3天、我的笔记 3天）在首次访问时从 MySQL 按需重建，不活跃用户不占内存
 - **Pipeline 批量优化**：布隆检查/标记 + VO 缓存读取 + isLiked 判赞 + LPOP 全部 pipeline 化，推荐流从 350 次 Redis 往返降至 ~15 次，热路径延迟从 600ms 压至 **23-30ms**
+- **Lua 原子抢购 + Stream 异步落库**：Redis Lua 脚本原子执行售罄检查 + 库存扣减 + 跨票档限购 + Stream 写入，Caffeine 本地售罄缓存（5s TTL）短路无效请求，Snowflake 预生成订单号，Stream Consumer 异步落库 MySQL 幂等兜底，取消/退款/超时 Lua 回滚库存
 - **双通道认证**：Cookie（SameSite=Lax）+ Authorization Bearer Header 兜底，解决浏览器 localhost Cookie 兼容性问题，Spring Security 返回 401 驱动前端跳转登录
 
 ## API 一览
