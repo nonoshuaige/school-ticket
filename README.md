@@ -90,15 +90,15 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 ### 二、双 Feed 流 — 推荐流（布隆消重）+ 关注流（推模式收件箱）
 
 ```
-┌─ 推荐流（公开） ─────────────────────────────┐
+┌─ 推荐流（需 userId 消重）─────────────────────┐
 │                                              │
 │  note:latest (ZSET)  ── 全站最新候选池 (1d)   │
 │       │                                      │
-│       ▼  shuffle → Bloom 过滤 → 截取 200     │
-│       │                                      │
+│       ▼  shuffle → user:bloom:seen:{userId}  │
+│       │   Bloom 去重 → 截取 200              │
 │       ▼                                      │
 │  feed:recommend:{userId} (List, 30min)       │
-│       │  session 级私有快照                    │
+│       │  session 级私有快照，未登录 → userId=0 │
 │       ▼                                      │
 │  LPOP pageSize 条 → VO 缓存批量读 → 响应      │
 │                                              │
