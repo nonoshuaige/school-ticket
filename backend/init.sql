@@ -1,5 +1,5 @@
 -- ============================================================
--- 校园活动票务系统 - 数据库初始化脚本 v3.3
+-- 校园活动票务系统 - 数据库初始化脚本 v3.8
 -- 数据库：school_ticket (utf8mb4)
 -- 含 100 用户 / 15 活动 / 44 票档 / 200 笔记 / 关注+点赞 / 0 评论
 -- 测试账号：13800138000 / 123456
@@ -18,6 +18,8 @@ SET NAMES utf8mb4;
 DROP TABLE IF EXISTS `note_like`;
 DROP TABLE IF EXISTS `user_note_comment`;
 DROP TABLE IF EXISTS `user_follow`;
+DROP TABLE IF EXISTS `refund`;
+DROP TABLE IF EXISTS `order_event_log`;
 DROP TABLE IF EXISTS `order`;
 DROP TABLE IF EXISTS `ticket_category`;
 DROP TABLE IF EXISTS `user_note`;
@@ -100,6 +102,41 @@ CREATE TABLE `order` (
   CONSTRAINT `fk_order_user` FOREIGN KEY (`user_id`) REFERENCES `user` (`user_id`),
   CONSTRAINT `fk_order_ticket` FOREIGN KEY (`ticket_id`) REFERENCES `ticket_category` (`ticket_id`)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单表';
+
+-- ============================================================
+-- 订单事件日志表（本地消息表）
+-- ============================================================
+CREATE TABLE `order_event_log` (
+  `id`          BIGINT       NOT NULL AUTO_INCREMENT COMMENT '自增ID',
+  `order_no`    VARCHAR(64)  NOT NULL                COMMENT '订单号',
+  `event_type`  TINYINT      NOT NULL                COMMENT '事件类型: 1=取消 2=退款 3=超时关单',
+  `user_id`     BIGINT       NOT NULL                COMMENT '用户ID',
+  `ticket_id`   BIGINT       NOT NULL                COMMENT '票档ID',
+  `quantity`    INT          NOT NULL                COMMENT '购买数量',
+  `status`      TINYINT      NOT NULL DEFAULT 0      COMMENT '0=待处理 1=已确认(Redis回滚成功) 2=失败(超限重试)',
+  `retry_count` INT          NOT NULL DEFAULT 0      COMMENT '重试次数',
+  `create_time` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `update_time` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`id`),
+  KEY `idx_status` (`status`, `create_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单事件日志（本地消息表，驱动Redis异步回滚）';
+
+-- ============================================================
+-- 退款表
+-- ============================================================
+CREATE TABLE `refund` (
+  `refund_id`   VARCHAR(64)  NOT NULL                COMMENT '退款单号（=原订单号）',
+  `order_no`    VARCHAR(64)  NOT NULL                COMMENT '原订单号',
+  `user_id`     BIGINT       NOT NULL                COMMENT '用户ID',
+  `ticket_id`   BIGINT       NOT NULL                COMMENT '票档ID',
+  `quantity`    INT          NOT NULL                COMMENT '购买数量',
+  `total_price` DECIMAL(10,2) NOT NULL               COMMENT '退款金额',
+  `status`      TINYINT      NOT NULL DEFAULT 0      COMMENT '0=待退款 1=退款成功 2=退款失败',
+  `create_time` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `update_time` DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`refund_id`),
+  KEY `idx_status` (`status`, `create_time`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='退款表（消费驱动退款执行）';
 
 -- ============================================================
 -- 关注关系表

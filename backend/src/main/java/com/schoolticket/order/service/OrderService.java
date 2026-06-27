@@ -14,7 +14,11 @@ import com.schoolticket.event.mapper.EventMapper;
 import com.schoolticket.event.mapper.TicketCategoryMapper;
 import com.schoolticket.order.cache.SoldOutCache;
 import com.schoolticket.order.entity.Order;
+import com.schoolticket.order.entity.OrderEventLog;
+import com.schoolticket.order.entity.Refund;
+import com.schoolticket.order.mapper.OrderEventLogMapper;
 import com.schoolticket.order.mapper.OrderMapper;
+import com.schoolticket.order.mapper.RefundMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.dao.DuplicateKeyException;
@@ -36,6 +40,8 @@ import java.util.stream.Collectors;
 public class OrderService {
 
     private final OrderMapper orderMapper;
+    private final OrderEventLogMapper orderEventLogMapper;
+    private final RefundMapper refundMapper;
     private final TicketCategoryMapper ticketCategoryMapper;
     private final EventMapper eventMapper;
     private final OrderLuaService orderLuaService;
@@ -131,7 +137,7 @@ public class OrderService {
     }
 
     /**
-     * 主动取消（未支付）→ DB 回滚 + Lua 回滚库存
+     * 主动取消（未支付）→ DB 回滚 + 写本地消息表驱动 Redis 回滚
      */
     @Transactional
     public Order cancelOrder(String orderNo) {
@@ -142,8 +148,8 @@ public class OrderService {
         order.setCancelTime(LocalDateTime.now());
         orderMapper.updateById(order);
 
-        // Lua 回滚 Redis 库存 + 售罄标记
-        rollbackRedis(order);
+        // 写本地消息表，由定时任务异步驱动 Redis Lua 回滚，保证逆向链路可靠
+        writeEventLog(order, 1);
 
         soldOutCache.invalidate(order.getTicketId());
         log.info("订单取消: orderNo={}", orderNo);
@@ -151,21 +157,24 @@ public class OrderService {
     }
 
     /**
-     * 退款（已支付 → 退款）→ DB 回滚 + Lua 回滚库存
+     * 退款（已支付 → 退款）→ 写退款表，由 RefundTask 异步消费
      */
     @Transactional
     public Order refundOrder(String orderNo) {
         Order order = getOrder(orderNo);
         validateStatus(order, 1, "只有已支付订单可退款");
-        replenishTicket(order);
-        order.setStatus(3);
-        order.setRefundTime(LocalDateTime.now());
-        orderMapper.updateById(order);
 
-        rollbackRedis(order);
+        Refund refund = new Refund();
+        refund.setRefundId(orderNo);
+        refund.setOrderNo(orderNo);
+        refund.setUserId(order.getUserId());
+        refund.setTicketId(order.getTicketId());
+        refund.setQuantity(order.getQuantity());
+        refund.setTotalPrice(order.getTotalPrice());
+        refund.setStatus(0);
+        refundMapper.insert(refund);
 
-        soldOutCache.invalidate(order.getTicketId());
-        log.info("订单退款: orderNo={}", orderNo);
+        log.info("退款申请已入表: orderNo={}", orderNo);
         return order;
     }
 
@@ -181,6 +190,24 @@ public class OrderService {
         orderMapper.updateById(order);
         log.info("订单核销: orderNo={}", orderNo);
         return order;
+    }
+
+    /**
+     * 消费退款表执行实际退款（由 RefundTask 调用）
+     * DB 回滚 + 写本地消息表驱动 Redis 回滚
+     */
+    @Transactional
+    public void processRefund(String orderNo) {
+        Order order = getOrder(orderNo);
+        replenishTicket(order);
+        order.setStatus(3);
+        order.setRefundTime(LocalDateTime.now());
+        orderMapper.updateById(order);
+
+        writeEventLog(order, 2);
+        soldOutCache.invalidate(order.getTicketId());
+
+        log.info("退款执行完成: orderNo={}", orderNo);
     }
 
     // ===================== 查询 =====================
@@ -254,11 +281,19 @@ public class OrderService {
     }
 
     /**
-     * Lua 回滚 Redis 库存 + 售罄标记 + 用户购买记录
+     * 写本地消息表，驱动异步 Redis 回滚
+     * 与 MySQL 状态变更在同一事务内，保证原子性
      */
-    private void rollbackRedis(Order order) {
-        orderLuaService.executeRollback(
-                order.getTicketId(), order.getUserId(), order.getQuantity());
+    private void writeEventLog(Order order, int eventType) {
+        OrderEventLog eventLog = new OrderEventLog();
+        eventLog.setOrderNo(order.getOrderNo());
+        eventLog.setEventType(eventType);
+        eventLog.setUserId(order.getUserId());
+        eventLog.setTicketId(order.getTicketId());
+        eventLog.setQuantity(order.getQuantity());
+        eventLog.setStatus(0);       // 待处理
+        eventLog.setRetryCount(0);
+        orderEventLogMapper.insert(eventLog);
     }
 
     /**
@@ -295,7 +330,7 @@ public class OrderService {
 
     /**
      * 超时关单 —— 由 OrderTimeoutTask 调用
-     * DB 回滚 + Redis 回滚
+     * DB 回滚 + 写本地消息表驱动 Redis 回滚
      */
     @Transactional
     public void expireOrder(Order order) {
@@ -304,7 +339,7 @@ public class OrderService {
         order.setCancelTime(LocalDateTime.now());
         orderMapper.updateById(order);
 
-        rollbackRedis(order);
+        writeEventLog(order, 3);
         soldOutCache.invalidate(order.getTicketId());
 
         log.info("超时关单: orderNo={}", order.getOrderNo());
