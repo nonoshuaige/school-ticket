@@ -41,6 +41,10 @@ mybatis-plus:
       logic-delete-value: 1
       logic-not-delete-value: 0
 
+# Feed 配置
+feed:
+  big-v-threshold: 1000  # 粉丝超过此数视为大V，走拉模式不fanout
+
 # JWT 配置
 jwt:
   secret: SchoolTicket2026SecretKeyForJWTTokenGenerationMustBeAtLeast256BitsLong

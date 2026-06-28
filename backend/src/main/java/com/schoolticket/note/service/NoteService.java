@@ -13,6 +13,7 @@ import com.schoolticket.user.service.RedisFollowService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
@@ -39,8 +40,12 @@ public class NoteService {
     private final StringRedisTemplate redis;
 
     private static final String FEED_KEY = "feed:recommend:%d";
+    private static final String FEED_FOLLOWING_KEY = "feed:following:%d";
     private static final int FEED_SNAPSHOT_SIZE = 200;
     private static final int FEED_TTL_MINUTES = 30;
+
+    @Value("${feed.big-v-threshold:1000}")
+    private int bigVThreshold;
 
     // ==================== 推荐流（快照拉取 — Session 级私有 Feed 队列） ====================
 
@@ -143,24 +148,69 @@ public class NoteService {
         return result;
     }
 
-    // ==================== 关注流（推模式：读自己收件箱） ====================
+    // ==================== 关注流（推拉结合：普通用户推 + 大V 拉） ====================
 
     public CursorPage<Map<String, Object>> followingFeed(Long currentUserId, Long cursor, int pageSize) {
         if (currentUserId == null) return CursorPage.of(Collections.emptyList(), null, false, 0);
 
-        // 懒加载：收件箱过期则从关注列表 + 作者笔记重建
         Set<Long> followingIds = redisFollowService.getFollowingIds(currentUserId);
-        noteRankingService.ensureInboxLoaded(currentUserId, followingIds);
+        if (followingIds.isEmpty()) return CursorPage.of(Collections.emptyList(), null, false, 0);
 
-        CursorPage<Map<String, Object>> inboxPage = noteRankingService.getFollowingFeedInbox(currentUserId, cursor, pageSize);
-        if (inboxPage.getRecords().isEmpty()) return inboxPage;
+        // 1. 区分大V 和普通关注者
+        Set<Long> bigVIds = noteRankingService.filterBigVIds(followingIds);
+        Set<Long> normalIds = new HashSet<>(followingIds);
+        normalIds.removeAll(bigVIds);
 
-        List<Long> noteIds = inboxPage.getRecords().stream()
-                .map(m -> (Long) m.get("noteId"))
+        // 2. 确保收件箱（只含普通用户的推内容）
+        if (!normalIds.isEmpty()) {
+            noteRankingService.ensureInboxLoaded(currentUserId, normalIds);
+        }
+
+        // 3. 从收件箱拉取（普通用户推内容）— overscan 2x 以便合并后有足够余量
+        Map<Long, Long> inboxEntries = new LinkedHashMap<>();
+        if (!normalIds.isEmpty()) {
+            CursorPage<Map<String, Object>> inboxPage =
+                    noteRankingService.getFollowingFeedInbox(currentUserId, cursor, pageSize * 2);
+            String inboxKey = String.format(FEED_FOLLOWING_KEY, currentUserId);
+            for (Map<String, Object> m : inboxPage.getRecords()) {
+                Long nid = (Long) m.get("noteId");
+                Double score = redis.opsForZSet().score(inboxKey, String.valueOf(nid));
+                if (score != null) {
+                    inboxEntries.putIfAbsent(nid, score.longValue());
+                }
+            }
+        }
+
+        // 4. 从大V 发件箱拉取
+        Map<Long, Long> bigVEntries = noteRankingService.pullFromBigVs(bigVIds, cursor, pageSize);
+
+        // 5. 合并两个来源的 (noteId → score)，按时间戳降序排列
+        Map<Long, Long> allEntries = new LinkedHashMap<>();
+        allEntries.putAll(inboxEntries);
+        for (Map.Entry<Long, Long> e : bigVEntries.entrySet()) {
+            allEntries.putIfAbsent(e.getKey(), e.getValue());
+        }
+
+        List<Map.Entry<Long, Long>> sorted = allEntries.entrySet().stream()
+                .sorted(Map.Entry.<Long, Long>comparingByValue().reversed())
                 .collect(Collectors.toList());
 
-        List<Map<String, Object>> records = assembleNoteVOsWithRepair(noteIds, currentUserId);
-        return CursorPage.of(records, inboxPage.getNextCursor(), inboxPage.isHasMore(), inboxPage.getTotal());
+        // 6. 截断取 pageSize 条，计算 nextCursor
+        List<Long> pageNoteIds = new ArrayList<>();
+        Long nextCursor = null;
+        for (int i = 0; i < Math.min(pageSize, sorted.size()); i++) {
+            Map.Entry<Long, Long> e = sorted.get(i);
+            pageNoteIds.add(e.getKey());
+            nextCursor = e.getValue();
+        }
+        boolean hasMore = sorted.size() > pageSize;
+
+        if (pageNoteIds.isEmpty()) {
+            return CursorPage.of(Collections.emptyList(), null, false, 0);
+        }
+
+        List<Map<String, Object>> records = assembleNoteVOsWithRepair(pageNoteIds, currentUserId);
+        return CursorPage.of(records, nextCursor != null ? String.valueOf(nextCursor) : null, hasMore, records.size());
     }
 
     // ==================== 我的笔记（独立分页） ====================
@@ -185,16 +235,24 @@ public class NoteService {
         // 2. 同步写入 latest + mine ZSET
         noteRankingService.addNote(note);
 
-        // 3. 推模式：fanout 到所有粉丝收件箱
-        Set<Long> fanIds = redisFollowService.getFanIds(userId);
+        // 3. 推拉结合：大V 只写 mine 不 fanout，普通用户 fanout
         long timestamp = toEpochMilli(note.getCreateTime());
-        noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
+        long fanCount = redisFollowService.getFansCount(userId);
+        Set<Long> fanIds;
+        if (fanCount < bigVThreshold) {
+            fanIds = redisFollowService.getFanIds(userId);
+            noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
+        } else {
+            noteRankingService.markBigV(userId);
+            fanIds = Collections.emptySet();
+        }
 
         // 4. MQ 异步兜底
         Map<String, Object> msg = new HashMap<>();
         msg.put("noteId", note.getNoteId());
         msg.put("userId", userId);
         msg.put("createTime", timestamp);
+        msg.put("bigV", fanCount >= bigVThreshold);
         msg.put("fanIds", fanIds.stream().map(String::valueOf).collect(Collectors.toList()));
         rabbitTemplate.convertAndSend("school.ticket.exchange", "note.create", msg);
 

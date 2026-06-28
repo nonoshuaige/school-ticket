@@ -3,12 +3,14 @@ package com.schoolticket.user.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.schoolticket.common.BusinessException;
 import com.schoolticket.dto.CursorPage;
+import com.schoolticket.note.service.RedisNoteRankingService;
 import com.schoolticket.user.entity.UserFollow;
 import com.schoolticket.user.entity.User;
 import com.schoolticket.user.mapper.UserFollowMapper;
 import com.schoolticket.user.mapper.UserMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -22,7 +24,11 @@ public class UserFollowService {
     private final UserFollowMapper userFollowMapper;
     private final UserMapper userMapper;
     private final RedisFollowService redisFollowService;
+    private final RedisNoteRankingService noteRankingService;
     private final RabbitTemplate rabbitTemplate;
+
+    @Value("${feed.big-v-threshold:1000}")
+    private int bigVThreshold;
 
     @Transactional
     public void follow(Long followerId, Long userId) {
@@ -44,6 +50,12 @@ public class UserFollowService {
         // 同步更新 Redis ZSET（快速路径）
         redisFollowService.addFollow(followerId, userId);
 
+        // 检查是否触发大V 标记
+        long newFanCount = redisFollowService.getFansCount(userId);
+        if (newFanCount >= bigVThreshold) {
+            noteRankingService.markBigV(userId);
+        }
+
         // RabbitMQ 异步通知
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", "follow");
@@ -60,6 +72,12 @@ public class UserFollowService {
                         .eq(UserFollow::getUserId, userId));
 
         redisFollowService.removeFollow(followerId, userId);
+
+        // 检查是否需要摘除大V 标记
+        long newFanCount = redisFollowService.getFansCount(userId);
+        if (newFanCount < bigVThreshold) {
+            noteRankingService.unmarkBigV(userId);
+        }
 
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", "unfollow");

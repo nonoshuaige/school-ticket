@@ -124,6 +124,65 @@ public class RedisNoteRankingService {
         redis.expire(inboxKey, FOLLOW_FEED_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
+    // ==================== 大V 标记（bigv:ids Set） ====================
+
+    private static final String BIGV_IDS_KEY = "bigv:ids";
+
+    public void markBigV(Long userId) {
+        redis.opsForSet().add(BIGV_IDS_KEY, String.valueOf(userId));
+    }
+
+    public void unmarkBigV(Long userId) {
+        redis.opsForSet().remove(BIGV_IDS_KEY, String.valueOf(userId));
+    }
+
+    public boolean isBigV(Long userId) {
+        return Boolean.TRUE.equals(redis.opsForSet().isMember(BIGV_IDS_KEY, String.valueOf(userId)));
+    }
+
+    /** 从关注列表中筛出大V ID */
+    public Set<Long> filterBigVIds(Set<Long> followingIds) {
+        if (followingIds == null || followingIds.isEmpty()) return Collections.emptySet();
+        Set<Long> result = new HashSet<>();
+        for (Long uid : followingIds) {
+            if (isBigV(uid)) result.add(uid);
+        }
+        return result;
+    }
+
+    // ==================== 拉模式：从大V 发件箱拉取 ====================
+
+    /**
+     * 从多个大V 的 note:mine 中拉取帖子，按时间倒序合并。
+     * 对每个大V 做 ZREVRANGEBYSCORE，收集 (noteId → score)，全局按 score 降序排列。
+     */
+    public Map<Long, Long> pullFromBigVs(Set<Long> bigVIds, Long cursor, int pageSize) {
+        Map<Long, Long> allEntries = new LinkedHashMap<>();
+        if (bigVIds == null || bigVIds.isEmpty()) return allEntries;
+
+        long max = cursor != null ? cursor - 1 : Long.MAX_VALUE;
+
+        for (Long authorId : bigVIds) {
+            String key = String.format(KEY_MINE, authorId);
+            Set<String> noteIdStrs = redis.opsForZSet().reverseRangeByScore(key, 0, max, 0, pageSize);
+            if (noteIdStrs == null) continue;
+            for (String nidStr : noteIdStrs) {
+                Long noteId = Long.valueOf(nidStr);
+                if (!allEntries.containsKey(noteId)) {
+                    Double score = redis.opsForZSet().score(key, nidStr);
+                    if (score != null) {
+                        allEntries.put(noteId, score.longValue());
+                    }
+                }
+            }
+        }
+
+        return allEntries.entrySet().stream()
+                .sorted(Map.Entry.<Long, Long>comparingByValue().reversed())
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue,
+                        (a, b) -> a, LinkedHashMap::new));
+    }
+
     // ==================== VO 缓存（note:vo:{noteId} Hash） ====================
 
     /** 发布笔记时写入 VO 缓存 */

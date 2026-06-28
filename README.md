@@ -107,7 +107,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 ---
 
-### 二、双 Feed 流 — 推荐流（布隆消重）+ 关注流（推模式收件箱）
+### 二、双 Feed 流 — 推荐流（布隆消重）+ 关注流（推拉结合）
 
 ```
 ┌─ 推荐流（需 userId 消重）─────────────────────┐
@@ -125,21 +125,28 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 │  热点延迟: 23-30ms（含 pipeline 批量优化）     │
 └──────────────────────────────────────────────┘
 
-┌─ 关注流（需登录）───────────────────────────┐
+┌─ 关注流（需登录，推拉结合 v3.11）─────────────┐
 │                                              │
-│  发布笔记 fanout-on-write:                    │
-│    遍历作者粉丝 → feed:following:{fanId}      │
-│    ZADD 写入每个粉丝收件箱 → 裁剪至 800 条     │
+│  发布笔记时分支判断:                            │
+│    fanCount < 1000?                           │
+│    ├─ YES → 推模式: fanout 到粉丝收件箱         │
+│    │    遍历作者粉丝 → feed:following:{fanId}   │
+│    │    ZADD 写入每个粉丝收件箱 → 裁剪至 800     │
+│    │                                          │
+│    └─ NO  → 拉模式: 标记 bigv:ids，不 fanout   │
+│             仅写 note:mine:{authorId}          │
 │       │                                      │
 │       ▼                                      │
-│  feed:following:{userId} (ZSET, 3d)          │
-│       │  ZREVRANGEBYSCORE 游标分页            │
+│  读取时合并两源:                                │
+│    ├─ 收件箱 feed:following:{userId}（推内容）  │
+│    ├─ 大V mine note:mine:{bigVId}（拉内容）     │
+│    ├─ 按时间戳 merge → 游标分页                 │
+│       │                                      │
 │       ▼                                      │
 │  VO 缓存批量读 → 响应                          │
 │                                              │
-│  新粉关注 → 从 author note:mine 回填 50 条    │
-│  取关    → ZREM 该作者全部笔记                │
-│  删笔记  → 遍历所有粉丝 ZREM                  │
+│  新粉关注 → 从 author mine 回填 50 条          │
+│  取关    → ZREM 该作者全部笔记 + 摘除大V 标记   │
 └──────────────────────────────────────────────┘
 ```
 
@@ -170,21 +177,21 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 > 推荐流冷启动 ~420ms（含 Lettuce 首连接 ~220ms），热路径 **23-30ms**。
 
-**关注流链路（推模式收件箱）：**
+**关注流链路（v3.11 推拉结合）：**
 
 | Redis Key | 类型 | TTL | 用途 |
 |-----------|------|-----|------|
-| `feed:following:{userId}` | ZSET | 3天 | 粉丝收件箱，发布时 fanout 写入，最多 800 条 |
+| `feed:following:{userId}` | ZSET | 3天 | 粉丝收件箱，仅普通用户（<1000粉）发布时 fanout 写入，最多 800 条 |
+| `bigv:ids` | Set | 持久 | 大V 用户 ID 集合，粉丝数 ≥ 阈值时自动加入 |
 | `user:follow:{userId}` | ZSET | 3天 | 关注作者列表 |
 | `user:fans:{userId}` | ZSET | 3天 | 粉丝列表（fanout 时查询） |
-| `note:mine:{userId}` | ZSET | 3天 | 作者发布的笔记索引（新粉补推数据源） |
+| `note:mine:{userId}` | ZSET | 3天 | 作者发布的笔记索引（大V 拉模式 + 新粉回填数据源） |
 
-**推模式关键操作：**
+**推拉结合关键机制：**
 
-- **发布时 fanout**：遍历粉丝列表 → 将 noteId 写入每个粉丝收件箱 ZSET → 裁剪至 800 条 → 续期 TTL
-- **新粉关注回填**：从 `note:mine:{authorId}` 拉取被关注者最近 50 条笔记，ZADD 到新粉丝收件箱
-- **取关清除**：遍历 `note:mine:{authorId}` 从收件箱 ZREM 该作者全部笔记
-- **删笔记清除**：遍历粉丝列表从所有收件箱 ZREM 该笔记
+- **发帖分支**（`feed.big-v-threshold: 1000`）：粉丝 < 1000 → 推，fanout 到粉丝收件箱；粉丝 ≥ 1000 → 拉，仅写 `note:mine` + 标记 `bigv:ids`
+- **读时合并**：收件箱（普通关注者推内容）+ 大V `note:mine` 拉取 → 按时间戳降序合并 → 游标分页
+- **关注联动**：关注时回填被关注者最近 50 条到收件箱 + 检查是否触发大V 标记；取关时清除收件箱该项 + 检查是否摘除大V 标记
 
 **按用户懒加载 + TTL 过期（v3.6）：**
 
@@ -290,7 +297,7 @@ npm run dev
 | POST | /api/v1/order/cancel | 取消订单（写消息表，异步回滚库存） |
 | POST | /api/v1/order/refund | 申请退款（写退款表，异步消费执行） |
 | GET | /api/v1/note/recommend-feed?cursor=&pageSize= | **推荐流（布隆消重 + 无限滚动）** |
-| GET | /api/v1/note/following-feed?cursor=&pageSize= | **关注流（推模式收件箱）** |
+| GET | /api/v1/note/following-feed?cursor=&pageSize= | **关注流（推拉结合，需登录）** |
 | GET | /api/v1/note/my-notes?cursor=&pageSize= | 我的笔记 |
 | POST | /api/v1/note/create | 发布笔记（触发 fanout） |
 | POST | /api/v1/note/{id}/like | 点赞 |

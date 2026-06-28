@@ -23,24 +23,28 @@ public class RedisSyncListener {
     private static final String KEY_LATEST  = "note:latest";
     private static final String KEY_MINE    = "note:mine:%d";
 
-    /** 创建笔记事件 → 加入 latest + mine ZSET + fanout 到粉丝收件箱 */
+    /** 创建笔记事件 → 加入 latest + mine ZSET + 推拉结合 fanout */
     @RabbitListener(queues = "#{noteCreateQueue.name}")
     public void handleNoteCreate(Map<String, Object> msg) {
         try {
             Long noteId = ((Number) msg.get("noteId")).longValue();
             Long userId = ((Number) msg.get("userId")).longValue();
             long score  = ((Number) msg.get("createTime")).longValue();
+            boolean bigV = Boolean.TRUE.equals(msg.get("bigV"));
             redis.opsForZSet().add(KEY_LATEST, String.valueOf(noteId), score);
             redis.opsForZSet().add(String.format(KEY_MINE, userId), String.valueOf(noteId), score);
 
-            // 异步 fanout 到粉丝收件箱
-            @SuppressWarnings("unchecked")
-            List<String> fanIdList = (List<String>) msg.get("fanIds");
-            if (fanIdList != null && !fanIdList.isEmpty()) {
-                Set<Long> fanIds = fanIdList.stream().map(Long::valueOf).collect(Collectors.toSet());
-                noteRankingService.fanoutToFollowers(userId, noteId, score, fanIds);
+            if (bigV) {
+                noteRankingService.markBigV(userId);
+            } else {
+                @SuppressWarnings("unchecked")
+                List<String> fanIdList = (List<String>) msg.get("fanIds");
+                if (fanIdList != null && !fanIdList.isEmpty()) {
+                    Set<Long> fanIds = fanIdList.stream().map(Long::valueOf).collect(Collectors.toSet());
+                    noteRankingService.fanoutToFollowers(userId, noteId, score, fanIds);
+                }
             }
-            log.info("Note create synced: noteId={} userId={}", noteId, userId);
+            log.info("Note create synced: noteId={} userId={} bigV={}", noteId, userId, bigV);
         } catch (Exception e) {
             log.error("handleNoteCreate error", e);
         }
