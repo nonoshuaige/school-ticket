@@ -85,6 +85,17 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 **库存预热：** 热卖中活动的票档库存预先写入 Redis `ticket:stock:{ticketId}` Key，TTL=活动结束时间，Lua 执行 DECRBY 无需回源 MySQL。
 
+**活动信息缓存（v3.9）：** 活动列表和详情查询改为 Redis 优先、MySQL 兜底。启动时将所有活跃活动（热卖+预热）预热到 Redis，前端按热卖/预热 Tab 分开展示。
+
+| Redis Key | 类型 | TTL | 用途 |
+|-----------|------|-----|------|
+| `event:pool:hot` | ZSET | saleEndTime | 热卖中活动 ID，score=eventStartTime |
+| `event:pool:warmup` | ZSET | max(saleStartTime)+1d | 预热中活动 ID，score=eventStartTime |
+| `event:vo:{eventId}` | String (JSON) | saleEndTime | 活动完整信息 + 预计算 minPrice |
+| `event:tickets:{eventId}` | String (JSON) | saleEndTime | 票档列表 JSON |
+
+查询路径：页面请求 → Redis ZSET 分页 → HGETALL VO 缓存 → 直接返回（不碰 MySQL）。VO miss / pool 脏数据自动从 MySQL 回填并修复。
+
 ---
 
 ### 二、双 Feed 流 — 推荐流（布隆消重）+ 关注流（推模式收件箱）
@@ -263,7 +274,7 @@ npm run dev
 |------|------|------|
 | POST | /api/v1/auth/register | 注册 |
 | POST | /api/v1/auth/login | 登录（JWT 写入 Cookie + 响应体） |
-| GET | /api/v1/event/list?page=&pageSize= | 活动列表（含最低票价） |
+| GET | /api/v1/event/list?status=&page=&pageSize= | 活动列表（status=1热卖/0预热，Redis优先，含最低票价） |
 | GET | /api/v1/event/{id} | 活动详情 + 票档 |
 | POST | /api/v1/order/create | **创建订单（Lua 抢购入口）** |
 | POST | /api/v1/order/pay | 模拟支付 |
@@ -314,7 +325,7 @@ npm run dev
 ├── frontend/                               # Vue 3 前端
 │   └── src/
 │       ├── views/
-│       │   ├── EventList.vue               # 活动列表（双列网格 + 分组）
+│       │   ├── EventList.vue               # 活动列表（热卖/预热 Tab 切换 + 双列网格）
 │       │   ├── Notes.vue                   # 双 Feed 切换（推荐/关注）
 │       │   └── NoteDetail.vue              # 笔记详情 + 二级评论
 │       ├── api/                            # auth / event / order / note / user

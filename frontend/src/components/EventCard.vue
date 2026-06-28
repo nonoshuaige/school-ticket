@@ -3,13 +3,17 @@
     <div class="card-banner">
       <div class="card-emoji">{{ emoji }}</div>
       <div class="card-status" v-if="isOnSale">热卖中</div>
-      <div class="card-status upcoming" v-else-if="new Date(event.saleStartTime) > new Date()">即将开售</div>
+      <div class="card-status upcoming" v-else-if="isUpcoming">即将开售</div>
       <div class="card-status ended" v-else>已结束</div>
     </div>
     <div class="card-body">
       <h3 class="card-title">{{ event.title }}</h3>
       <div class="card-info">
-        <div class="info-row">📅 {{ formatDateShort(event.eventStartTime) }}</div>
+        <div class="info-row sale-row">
+          {{ isOnSale ? '🎫 截止' : isUpcoming ? '🎫 开售' : '🎫' }}
+          {{ isOnSale ? formatDateTime(event.saleEndTime) : formatDateTime(event.saleStartTime) }}
+        </div>
+        <div class="info-row">📅 {{ formatDateTime(event.eventStartTime) }}</div>
         <div class="info-row">📍 {{ event.venue }}</div>
       </div>
       <div class="card-price">¥{{ minPrice }} 起</div>
@@ -19,13 +23,20 @@
 
 <script setup>
 import { computed } from 'vue'
-import { formatDateShort } from '../utils/format'
+import { formatDateTime } from '../utils/format'
 
 const props = defineProps({
   event: { type: Object, required: true }
 })
 
 defineEmits(['click'])
+
+const now = Date.now()
+const saleStart = computed(() => new Date(props.event.saleStartTime).getTime())
+const saleEnd = computed(() => new Date(props.event.saleEndTime).getTime())
+
+const isOnSale = computed(() => now >= saleStart.value && now <= saleEnd.value)
+const isUpcoming = computed(() => now < saleStart.value)
 
 const emoji = computed(() => {
   const map = {
@@ -38,11 +49,6 @@ const emoji = computed(() => {
     if (props.event.title.includes(key)) return val
   }
   return '🎪'
-})
-
-const isOnSale = computed(() => {
-  const now = Date.now()
-  return now >= new Date(props.event.saleStartTime).getTime() && now <= new Date(props.event.saleEndTime).getTime()
 })
 
 const minPrice = computed(() => {
@@ -93,5 +99,6 @@ const minPrice = computed(() => {
 }
 .card-info { margin-bottom: 6px; }
 .info-row { font-size: 12px; color: #888; line-height: 1.6; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sale-row { color: #e67e22; font-weight: 500; }
 .card-price { font-size: 16px; font-weight: 700; color: #f40; }
 </style>

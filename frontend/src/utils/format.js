@@ -42,6 +42,16 @@ export function orderStatusColor(status) {
 }
 
 /**
+ * 格式化日期时间（短格式：MM/DD HH:mm）
+ */
+export function formatDateTime(dateStr) {
+  if (!dateStr) return ''
+  const d = new Date(dateStr)
+  const pad = (n) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+/**
  * 剩余时间（倒计时用）
  */
 export function countdown(expireTime) {
