@@ -13,8 +13,14 @@
 ```
 用户请求
   │
+  ├─ 0. 幂等保护（v3.10）
+  │      ├─ 前端生成 UUID 幂等键，携带于请求体
+  │      ├─ Redis SET NX EX 300 原子抢占 idempotent:order:{key} = "PENDING"
+  │      ├─ 抢占失败 → GET key = orderNo? → 幂等返回已有订单
+  │      └─ 抢占失败 → GET key = "PENDING"? → 409 "请求处理中"
+  │
   ├─ 1. Caffeine 本地缓存短路（5s TTL）
-  │      └─ soldOut=true → 直接返回"已售罄"，不碰 Redis
+  │      └─ soldOut=true → 释放幂等键，返回"已售罄"
   │
   ├─ 2. 无锁 selectById 查票档/活动信息
   │
@@ -30,7 +36,8 @@
   │      └─ XADD stream:orders * orderId userId ticketId qty price expireTime
   │
   ├─ 5. Lua 返回 0 → INSERT MySQL（前端立即可见）
-  │      └─ Stream Consumer 异步幂等兜底（主键去重）
+  │      ├─ 成功 → SET idempotent:order:{key} = orderNo
+  │      └─ DuplicateKeyException → Stream 先落库 → 幂等返回已有订单
   │
   └─ 6. 正向链路完成
         │
@@ -66,6 +73,7 @@
 | 每人囤票 | `ticket:purchase:{ticketId}` Hash 记录 userId→qty，单票档上限 5 张 | 杜绝脚本囤票 |
 | 售罄后无效请求穿透 Redis | Caffeine 本地缓存 `Cache<Long, Boolean>`，5s TTL，仅存售罄=true | 秒级短路，Redis 压力归零 |
 | 订单号全局唯一 | Hutool Snowflake（无中心化依赖） | 预生成，不依赖 DB 自增 |
+| 重复提交/网络重试 | Redis SET NX EX 300 原子抢占幂等键 + DuplicateKeyException 兜底 | 同一次请求仅创建一个订单 |
 | 缓存/DB 一致性 | 前端订单直插 MySQL + Stream Consumer 异步幂等兜底 | 前端立即可见，双重保障 |
 | 库存恢复 | rollback.lua 原子 INCRBY + DEL soldout + 减少购买记录 | 取消/退款秒级回补 |
 | 逆向链路可靠性 | 本地消息表 `order_event_log`（与业务在同一事务内 INSERT）→ 定时任务扫描 status=0 → 执行 Lua → 成功 ack status=1，失败重试最多 5 次 | Redis 临时不可用时不影响业务返回，最终一致 |
@@ -89,6 +97,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 | Redis Key | 类型 | TTL | 用途 |
 |-----------|------|-----|------|
+| `idempotent:order:{key}` | String | 300s | 幂等键 → "PENDING" 或 orderNo，防重复提交 |
 | `event:pool:hot` | ZSET | saleEndTime | 热卖中活动 ID，score=eventStartTime |
 | `event:pool:warmup` | ZSET | max(saleStartTime)+1d | 预热中活动 ID，score=eventStartTime |
 | `event:vo:{eventId}` | String (JSON) | saleEndTime | 活动完整信息 + 预计算 minPrice |
@@ -276,7 +285,7 @@ npm run dev
 | POST | /api/v1/auth/login | 登录（JWT 写入 Cookie + 响应体） |
 | GET | /api/v1/event/list?status=&page=&pageSize= | 活动列表（status=1热卖/0预热，Redis优先，含最低票价） |
 | GET | /api/v1/event/{id} | 活动详情 + 票档 |
-| POST | /api/v1/order/create | **创建订单（Lua 抢购入口）** |
+| POST | /api/v1/order/create | **创建订单（幂等键 + Lua 抢购入口）** |
 | POST | /api/v1/order/pay | 模拟支付 |
 | POST | /api/v1/order/cancel | 取消订单（写消息表，异步回滚库存） |
 | POST | /api/v1/order/refund | 申请退款（写退款表，异步消费执行） |

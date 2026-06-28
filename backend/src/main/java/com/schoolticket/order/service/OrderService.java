@@ -52,71 +52,120 @@ public class OrderService {
     // ===================== 核心履约 =====================
 
     /**
-     * 创建订单（Redis Lua 原子扣库存 + 本地售罄缓存 + Stream 异步落库）
+     * 创建订单（幂等保护 + Redis Lua 原子扣库存 + 本地售罄缓存 + Stream 异步落库）
      */
     @Transactional
     public Order createOrder(Long userId, OrderCreateReq req) {
-        // 1. 本地售罄缓存短路
-        if (soldOutCache.isSoldOut(req.getTicketId())) {
-            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+        // 0. 幂等保护：检查是否已处理过此请求
+        String existing = orderLuaService.getIdempotentResult(req.getIdempotencyKey());
+        if (existing != null && !"PENDING".equals(existing)) {
+            Order cached = orderMapper.selectOne(
+                    new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, existing));
+            if (cached != null) {
+                log.info("幂等命中: idempotencyKey={}, orderNo={}", req.getIdempotencyKey(), existing);
+                return cached;
+            }
+            // 键指向的订单不存在（异常情况），清理后继续
+            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
         }
 
-        // 2. 查票档信息（无锁 selectById）
-        TicketCategory ticket = ticketCategoryMapper.selectById(req.getTicketId());
-        if (ticket == null) {
-            throw new BusinessException(BusinessException.INVALID_PARAM, "票档不存在");
+        // 原子抢占幂等键，失败 = 并发冲突
+        if (!orderLuaService.tryClaimIdempotentKey(req.getIdempotencyKey())) {
+            existing = orderLuaService.getIdempotentResult(req.getIdempotencyKey());
+            if (existing != null && !"PENDING".equals(existing)) {
+                Order cached = orderMapper.selectOne(
+                        new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, existing));
+                if (cached != null) return cached;
+            }
+            throw new BusinessException(409, "请求处理中，请勿重复提交");
         }
 
-        Event event = eventMapper.selectById(ticket.getEventId());
-        if (event == null) {
-            throw new BusinessException(BusinessException.INVALID_PARAM, "活动不存在");
+        try {
+            // 1. 本地售罄缓存短路
+            if (soldOutCache.isSoldOut(req.getTicketId())) {
+                throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+            }
+
+            // 2. 查票档信息（无锁 selectById）
+            TicketCategory ticket = ticketCategoryMapper.selectById(req.getTicketId());
+            if (ticket == null) {
+                throw new BusinessException(BusinessException.INVALID_PARAM, "票档不存在");
+            }
+
+            Event event = eventMapper.selectById(ticket.getEventId());
+            if (event == null) {
+                throw new BusinessException(BusinessException.INVALID_PARAM, "活动不存在");
+            }
+
+            // 3. 预生成订单号
+            String orderNo = IdUtil.getSnowflakeNextIdStr();
+            BigDecimal totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
+            long expireTimeMs = LocalDateTime.now().plusMinutes(EXPIRE_MINUTES)
+                    .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
+
+            // 4. 查该活动所有票档 ID（跨票档检查用）
+            List<Long> allTicketIds = ticketCategoryMapper.selectList(
+                    new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, event.getEventId()))
+                    .stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
+
+            // 5. 执行 Lua 脚本
+            List<Object> result = orderLuaService.executePurchase(
+                    req.getTicketId(), userId, event.getEventId(), orderNo,
+                    req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs,
+                    allTicketIds);
+
+            long code = result.get(0) instanceof Long ? (Long) result.get(0)
+                    : ((Number) result.get(0)).longValue();
+
+            if (code == -1 || code == -2) {
+                soldOutCache.markSoldOut(req.getTicketId());
+                throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+            }
+            if (code == -3) {
+                throw new BusinessException("该票档最多购买5张");
+            }
+            if (code == -4) {
+                throw new BusinessException("该活动您已购买其他票档，每个活动只能购买一类票");
+            }
+
+            // 6. 落库
+            Order order = new Order();
+            order.setOrderNo(orderNo);
+            order.setUserId(userId);
+            order.setTicketId(req.getTicketId());
+            order.setQuantity(req.getQuantity());
+            order.setTotalPrice(totalPrice);
+            order.setStatus(0);
+            order.setExpireTime(LocalDateTime.now().plusMinutes(EXPIRE_MINUTES));
+            orderMapper.insert(order);
+
+            // 成功：幂等键指向订单号
+            orderLuaService.completeIdempotentKey(req.getIdempotencyKey(), orderNo);
+            log.info("订单创建: orderNo={}, userId={}, ticketId={}, qty={}",
+                    orderNo, userId, req.getTicketId(), req.getQuantity());
+            return order;
+
+        } catch (BusinessException e) {
+            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
+            throw e;
+        } catch (DuplicateKeyException e) {
+            // Stream Consumer 先一步插入，主线程 INSERT 冲突 → 幂等返回已有订单
+            Order dupOrder = orderMapper.selectOne(
+                    new LambdaQueryWrapper<Order>().eq(Order::getUserId, userId)
+                            .eq(Order::getTicketId, req.getTicketId())
+                            .orderByDesc(Order::getCreateTime)
+                            .last("LIMIT 1"));
+            if (dupOrder != null) {
+                orderLuaService.completeIdempotentKey(req.getIdempotencyKey(), dupOrder.getOrderNo());
+                log.info("Stream 已落库，幂等返回: orderNo={}", dupOrder.getOrderNo());
+                return dupOrder;
+            }
+            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
+            throw e;
+        } catch (Exception e) {
+            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
+            throw e;
         }
-
-        // 3. 预生成订单号
-        String orderNo = IdUtil.getSnowflakeNextIdStr();
-        BigDecimal totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
-        long expireTimeMs = LocalDateTime.now().plusMinutes(EXPIRE_MINUTES)
-                .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
-
-        // 4. 查该活动所有票档 ID（跨票档检查用）
-        List<Long> allTicketIds = ticketCategoryMapper.selectList(
-                new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, event.getEventId()))
-                .stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
-
-        // 5. 执行 Lua 脚本（原子：售罄检查 + 库存扣减 + 限购 + 跨票档 + Stream 写入）
-        List<Object> result = orderLuaService.executePurchase(
-                req.getTicketId(), userId, event.getEventId(), orderNo,
-                req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs,
-                allTicketIds);
-
-        long code = result.get(0) instanceof Long ? (Long) result.get(0)
-                : ((Number) result.get(0)).longValue();
-
-        if (code == -1 || code == -2) {
-            soldOutCache.markSoldOut(req.getTicketId());
-            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
-        }
-        if (code == -3) {
-            throw new BusinessException("该票档最多购买5张");
-        }
-        if (code == -4) {
-            throw new BusinessException("该活动您已购买其他票档，每个活动只能购买一类票");
-        }
-
-        // 6. 直接落库（前端需立即获取订单数据；Stream 消费者做幂等兜底）
-        Order order = new Order();
-        order.setOrderNo(orderNo);
-        order.setUserId(userId);
-        order.setTicketId(req.getTicketId());
-        order.setQuantity(req.getQuantity());
-        order.setTotalPrice(totalPrice);
-        order.setStatus(0);
-        order.setExpireTime(LocalDateTime.now().plusMinutes(EXPIRE_MINUTES));
-        orderMapper.insert(order);
-
-        log.info("订单创建: orderNo={}, userId={}, ticketId={}, qty={}",
-                orderNo, userId, req.getTicketId(), req.getQuantity());
-        return order;
     }
 
     /**

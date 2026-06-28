@@ -117,6 +117,33 @@ public class OrderLuaService {
         });
     }
 
+    // ===================== 幂等键 =====================
+
+    private static final String IDEMPOTENT_PREFIX = "idempotent:order:";
+    private static final int IDEMPOTENT_TTL = 300; // 5 分钟
+
+    /** SET NX 原子抢占幂等键，成功返回 true */
+    public boolean tryClaimIdempotentKey(String idempotencyKey) {
+        return Boolean.TRUE.equals(redis.opsForValue()
+                .setIfAbsent(IDEMPOTENT_PREFIX + idempotencyKey, "PENDING",
+                        IDEMPOTENT_TTL, java.util.concurrent.TimeUnit.SECONDS));
+    }
+
+    /** 获取幂等键当前值（null=不存在, PENDING=处理中, 其他=订单号） */
+    public String getIdempotentResult(String idempotencyKey) {
+        return redis.opsForValue().get(IDEMPOTENT_PREFIX + idempotencyKey);
+    }
+
+    /** 订单创建成功，将幂等键更新为订单号 */
+    public void completeIdempotentKey(String idempotencyKey, String orderNo) {
+        redis.opsForValue().set(IDEMPOTENT_PREFIX + idempotencyKey, orderNo, IDEMPOTENT_TTL, java.util.concurrent.TimeUnit.SECONDS);
+    }
+
+    /** 业务失败，释放幂等键 */
+    public void releaseIdempotentKey(String idempotencyKey) {
+        redis.delete(IDEMPOTENT_PREFIX + idempotencyKey);
+    }
+
     /**
      * 获取 Redis 中票档库存（绕过 JSON 反序列化器，读裸字符串）
      */
