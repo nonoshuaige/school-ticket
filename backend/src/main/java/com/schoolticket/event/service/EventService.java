@@ -181,8 +181,8 @@ public class EventService {
 
             if (event == null) {
                 staleIds.add(String.valueOf(id)); // DB 也不存在，清除
-            } else if (status != null && !status.equals(event.getStatus())) {
-                staleIds.add(String.valueOf(id)); // 状态变了，清除
+            } else if (!isTimeValidForStatus(event, status)) {
+                staleIds.add(String.valueOf(id)); // 时间窗口不符（已过期/已开售），清除
             } else {
                 cleanIds.add(id);
             }
@@ -217,28 +217,54 @@ public class EventService {
     private IPage<Event> getEventListFromMySQL(Integer status, Integer page, Integer pageSize) {
         LambdaQueryWrapper<Event> wrapper = new LambdaQueryWrapper<Event>()
                 .orderByAsc(Event::getEventStartTime);
-        if (status != null) {
-            wrapper.eq(Event::getStatus, status);
-        }
+        addTimeCondition(wrapper, status);
         IPage<Event> result = eventMapper.selectPage(new Page<>(page, pageSize), wrapper);
         fillMinPrices(result.getRecords());
         return result;
     }
 
+    /**
+     * 时间窗口校验：热卖中要求 saleEndTime > now，预热中要求 saleStartTime > now
+     */
+    private boolean isTimeValidForStatus(Event event, Integer status) {
+        if (status == null) return true;
+        LocalDateTime now = LocalDateTime.now();
+        if (status == 1) return !event.getSaleStartTime().isAfter(now) && event.getSaleEndTime().isAfter(now);
+        if (status == 0) return event.getSaleStartTime().isAfter(now);
+        return true;
+    }
+
+    private void addTimeCondition(LambdaQueryWrapper<Event> wrapper, Integer status) {
+        if (status == null) return;
+        if (status == 1) {
+            wrapper.le(Event::getSaleStartTime, LocalDateTime.now())
+                   .gt(Event::getSaleEndTime, LocalDateTime.now());
+        } else if (status == 0) {
+            wrapper.gt(Event::getSaleStartTime, LocalDateTime.now());
+        }
+    }
+
     // ===================== 预热 =====================
 
     /**
-     * 启动时预热：将所有活跃活动（预热中 + 热卖中）的数据同步到 Redis
-     * - 热卖中: 库存 + event VO + tickets + hot pool ZSET，TTL=saleEndTime
-     * - 预热中: event VO + tickets + warmup pool ZSET，TTL=saleStartTime+1d
+     * 启动时预热：将所有未结束活动（saleEndTime > now）的数据同步到 Redis。
+     * 按 saleStartTime 分流：已开售→hot pool，未开售→warmup pool
      */
     @PostConstruct
     public void preloadEvents() {
         try {
-            List<Event> hotEvents = eventMapper.selectList(
-                    new LambdaQueryWrapper<Event>().eq(Event::getStatus, 1));
-            List<Event> warmupEvents = eventMapper.selectList(
-                    new LambdaQueryWrapper<Event>().eq(Event::getStatus, 0));
+            // 拉取所有 saleEndTime > now 的活动（排除已结束）
+            List<Event> allActive = eventMapper.selectList(
+                    new LambdaQueryWrapper<Event>()
+                            .gt(Event::getSaleEndTime, LocalDateTime.now()));
+
+            LocalDateTime now = LocalDateTime.now();
+            List<Event> hotEvents = allActive.stream()
+                    .filter(e -> !e.getSaleStartTime().isAfter(now))
+                    .collect(Collectors.toList());
+            List<Event> warmupEvents = allActive.stream()
+                    .filter(e -> e.getSaleStartTime().isAfter(now))
+                    .collect(Collectors.toList());
 
             // 热卖中：库存 + VO + tickets + hot pool
             int stockCount = 0;
@@ -348,10 +374,13 @@ public class EventService {
     }
 
     private long getEventExpireSec(Event event) {
-        if (event.getStatus() == 1) {
-            return event.getSaleEndTime().atZone(ZoneId.of("Asia/Shanghai")).toEpochSecond();
+        LocalDateTime now = LocalDateTime.now();
+        // 未开售（预热中）：TTL = saleStartTime + 1天
+        if (event.getSaleStartTime() != null && now.isBefore(event.getSaleStartTime())) {
+            return event.getSaleStartTime().atZone(ZoneId.of("Asia/Shanghai")).toEpochSecond() + 86400;
         }
-        return event.getSaleStartTime().atZone(ZoneId.of("Asia/Shanghai")).toEpochSecond() + 86400;
+        // 已开售（热卖中或已结束）：TTL = saleEndTime
+        return event.getSaleEndTime().atZone(ZoneId.of("Asia/Shanghai")).toEpochSecond();
     }
 
     private long getEventExpireAt(Long eventId) {

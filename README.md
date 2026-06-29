@@ -93,7 +93,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 **库存预热：** 热卖中活动的票档库存预先写入 Redis `ticket:stock:{ticketId}` Key，TTL=活动结束时间，Lua 执行 DECRBY 无需回源 MySQL。
 
-**活动信息缓存（v3.9）：** 活动列表和详情查询改为 Redis 优先、MySQL 兜底。启动时将所有活跃活动（热卖+预热）预热到 Redis，前端按热卖/预热 Tab 分开展示。
+**活动信息缓存（v3.9 / v3.12 完善）：** 活动列表和详情查询改为 Redis 优先、MySQL 兜底。启动时将所有活跃活动（热卖+预热）预热到 Redis，前端按热卖/预热 Tab 分开展示。v3.12 将 status 改为实时计算字段（基于 saleStartTime/saleEndTime vs 当前时间），消除 DB 状态与时间窗口不同步问题；MySQL 兜底路径补全 saleStartTime ≤ now 条件，确保热卖/预热精确分流。
 
 | Redis Key | 类型 | TTL | 用途 |
 |-----------|------|-----|------|
