@@ -117,6 +117,71 @@ public class EventService {
         return tickets;
     }
 
+    /**
+     * 批量获取活动摘要（轻量版，供笔记流/详情使用）
+     * Pipeline GET event:vo:{eventId} JSON → 提取关键字段
+     * miss 时查 MySQL + 回填 Redis
+     */
+    public Map<Long, Map<String, Object>> batchGetEventSummaries(List<Long> eventIds) {
+        Map<Long, Map<String, Object>> result = new LinkedHashMap<>();
+        if (eventIds == null || eventIds.isEmpty()) return result;
+
+        List<byte[]> rawKeys = eventIds.stream()
+                .map(eid -> (EVENT_VO_PREFIX + eid).getBytes(java.nio.charset.StandardCharsets.UTF_8))
+                .collect(Collectors.toList());
+
+        List<Object> pipeResults = redis.executePipelined(
+                (org.springframework.data.redis.connection.RedisConnection connection) -> {
+            for (byte[] key : rawKeys) {
+                connection.stringCommands().get(key);
+            }
+            return null;
+        });
+
+        Set<Long> missEids = new LinkedHashSet<>();
+        for (int i = 0; i < eventIds.size(); i++) {
+            Object obj = pipeResults.get(i);
+            Long eid = eventIds.get(i);
+            if (obj instanceof String json && !json.isEmpty()) {
+                try {
+                    Event event = fromJson(json, Event.class);
+                    result.put(eid, toSummaryMap(event));
+                } catch (Exception e) {
+                    missEids.add(eid);
+                }
+            } else {
+                missEids.add(eid);
+            }
+        }
+
+        // MySQL 兜底 + 回填
+        if (!missEids.isEmpty()) {
+            List<Event> missEvents = eventMapper.selectBatchIds(missEids);
+            for (Event event : missEvents) {
+                fillMinPrice(event, ticketCategoryMapper.selectList(
+                        new LambdaQueryWrapper<TicketCategory>()
+                                .eq(TicketCategory::getEventId, event.getEventId())));
+                cacheEvents(Collections.singletonList(event));
+                result.put(event.getEventId(), toSummaryMap(event));
+            }
+        }
+
+        return result;
+    }
+
+    private Map<String, Object> toSummaryMap(Event event) {
+        Map<String, Object> summary = new LinkedHashMap<>();
+        summary.put("eventId", event.getEventId());
+        summary.put("title", event.getTitle());
+        summary.put("posterUrl", event.getPosterUrl());
+        summary.put("minPrice", event.getMinPrice() != null ? event.getMinPrice().doubleValue() : 0);
+        summary.put("eventStartTime", event.getEventStartTime() != null ? event.getEventStartTime().toString() : null);
+        summary.put("saleStartTime", event.getSaleStartTime() != null ? event.getSaleStartTime().toString() : null);
+        summary.put("saleEndTime", event.getSaleEndTime() != null ? event.getSaleEndTime().toString() : null);
+        summary.put("venue", event.getVenue());
+        return summary;
+    }
+
     public Map<String, Object> getPurchaseStatus(Long eventId, Long userId) {
         Map<String, Object> result = new HashMap<>();
         result.put("purchasedTicketId", null);

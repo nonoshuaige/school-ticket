@@ -123,10 +123,31 @@ const noteContents = [
   '分享一个PPT模板网站，做展示很有用',
   '校园网又崩了...',
 ];
+// 种草笔记内容（按 noteId 位置插入，i+1 = noteId）
+const eventNotes = {
+  3:  { uid: 6,  evt: 4, content: '刚看完戏剧社的《仲夏夜之梦》改编版，古典台词和现代舞台的碰撞太惊艳了！强烈安利！' },
+  12: { uid: 10, evt: 2, content: '校园歌手大赛总决赛这周五开抢！去年冠军唱得太炸了，今年必须再冲～' },
+  25: { uid: 58, evt: 3, content: '校艺术团的新年联欢晚会有交响乐和魔术表演诶，8月1号音乐厅，已定好闹钟抢票！' },
+  46: { uid: 82, evt: 1, content: '毕业晚会「青春不散场」7月10号大礼堂，歌舞小品乐队全都有，学弟学妹别错过！' },
+  55: { uid: 1,  evt: 5, content: '篮球联赛决赛7月6号综合体育馆，现场DJ+啦啦队！去年决赛加时三次看得我嗓子都喊哑了' },
+  73: { uid: 91, evt: 6, content: '动漫嘉年华「次元狂欢」7月13号！Cosplay大赛+声优见面会，二次元必冲啊' },
+  91: { uid: 79, evt: 8, content: '摄影大赛作品展7月20号图书馆展厅开展，今年「校园之美」主题，投稿截止前还能交！' },
+  105: { uid: 67, evt: 9, content: '校园音乐节「夏日音浪」7月30号操场主舞台！摇滚民谣说唱轮番上，连续6小时，绝了' },
+  134: { uid: 88, evt: 12, content: '校园马拉松7月16号开跑，5公里欢乐跑+半马，校园最美路线，完赛就有纪念奖牌！' },
+  165: { uid: 48, evt: 15, content: '中秋游园会9月15号湖畔广场！汉服体验+猜灯谜+放河灯，还能自己动手做月饼～' },
+};
+
 const noteLines = [];
 for (let i = 0; i < 200; i++) {
-  const uid = rand(1, 100);
-  const content = pick(noteContents);
+  const noteId = i + 1;
+  let uid, content;
+  if (eventNotes[noteId]) {
+    uid = eventNotes[noteId].uid;
+    content = eventNotes[noteId].content;
+  } else {
+    uid = rand(1, 100);
+    content = pick(noteContents);
+  }
   const m = rand(3, 6);
   const d = m === 6 ? rand(1, 21) : rand(1, 28);
   const time = dt(0, m, d, rand(0,23), rand(0,59));
@@ -167,7 +188,17 @@ for (let i = 0; i < 500; i++) {
 lines.push('-- 随机点赞数据');
 lines.push('INSERT INTO `note_like` (`note_id`, `user_id`) VALUES');
 lines.push(likeLines.join(',\n') + ';');
+lines.push('');
+
+// ========== 10 条笔记关联活动（种草，笔记内容与活动对应）==========
+const neLines = [];
+for (const [noteId, info] of Object.entries(eventNotes)) {
+  neLines.push(`(${noteId}, ${info.evt})`);
+}
+lines.push('-- 笔记关联活动（种草）');
+lines.push('INSERT INTO `note_event` (`note_id`, `event_id`) VALUES');
+lines.push(neLines.join(',\n') + ';');
 
 // 输出
 fs.writeFileSync('gen_data.sql', lines.join('\n'), 'utf-8');
-console.log(`Generated: ${followSet.size} follows, ${likeSet.size} likes, 100 users, 15 events, ${tid-1} tickets, ${noteLines.length} notes`);
+console.log(`Generated: ${followSet.size} follows, ${likeSet.size} likes, ${neSet.size} note-event links, 100 users, 15 events, ${tid-1} tickets, ${noteLines.length} notes`);

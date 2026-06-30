@@ -1,10 +1,10 @@
 # 🎫 校园活动票务系统
 
-> Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**与**双 Feed 流推荐**两大核心场景。
+> Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
 
 ## 项目简介
 
-面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。项目从零构建了完整的订单履约闭环与 Feed 流信息流系统。
+面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。项目从零构建了完整的订单履约闭环与 Feed 流信息流系统。
 
 ## 🎯 核心亮点
 
@@ -199,6 +199,48 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 ---
 
+### 三、种草笔记系统 — 笔记关联活动 + 种草徽章 + 活动卡片跳转（v4.0）
+
+```
+┌─ 种草笔记链路 ─────────────────────────────────┐
+│                                                │
+│  发布笔记 POST /api/v1/note/create              │
+│    { content, eventIds: [1, 2] }               │
+│       │                                        │
+│       ├─ INSERT user_note                       │
+│       ├─ INSERT note_event (noteId, eventId)    │
+│       └─ cacheNoteEvents → Redis                │
+│              │                                  │
+│              ▼                                  │
+│  Feed 流加载时（推荐/关注/我的笔记）:              │
+│    ├─ assembleNoteVOsWithRepair                 │
+│    │    ├─ pipeline GET  note:events:{noteId}   │
+│    │    │   miss → MySQL note_event → 回填      │
+│    │    └─ pipeline GET  event:vo:{eventId}     │
+│    │        miss → MySQL event → 回填            │
+│    ▼                                            │
+│  VO 含 eventIds + events[]                      │
+│    ├─ eventIds.length > 0?                      │
+│    │   └─ YES → 卡片显示 🛍️种草 徽章             │
+│    └─ 笔记详情页:                                │
+│        └─ 种草好物区域 → EventCard 双列 Grid     │
+│           └─ 点击 → /event/:id 购票              │
+└────────────────────────────────────────────────┘
+```
+
+| Redis Key | 类型 | TTL | 用途 |
+|-----------|------|-----|------|
+| `note:events:{noteId}` | String | 7天 | 逗号分隔的关联 eventId 列表（空串=无关联），按需懒加载 |
+| `event:vo:{eventId}` | String (JSON) | saleEndTime | 活动摘要（title, minPrice, venue, time...），复用活动缓存 |
+
+**设计要点：**
+- `note_event` 多对多表以代理自增主键 + 唯一约束解耦笔记与活动
+- 种草数据按需懒加载：不活跃笔记不占 Redis 内存，与 VO 缓存模式一致
+- 活动摘要复用现有 `event:vo:{eventId}` JSON 缓存，与活动列表共享
+- 10 条测试种草笔记，内容与关联活动精确对应
+
+---
+
 ## 🔧 技术栈
 
 | 层 | 技术 | 说明 |
@@ -206,7 +248,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | 前端 | Vue 3 (Composition API) · Vite 5 · Pinia · Axios · Vant 4 | 移动端 UI，三 Tab 导航 |
 | 后端 | Java 21 · Spring Boot 3.2.5 · Spring Security 6 | Cookie + JWT 双通道无状态认证 |
 | ORM | MyBatis-Plus 3.5.7 | 分页插件 + Lambda 查询 |
-| 数据库 | MySQL 8.0 | 10 张表，100 用户 / 15 活动 / 200 笔记 |
+| 数据库 | MySQL 8.0 | 11 张表，100 用户 / 15 活动 / 200 笔记 / 10 种草关联 |
 | 缓存 | Redis 7.4 (Alpine) | ZSET 游标分页 + Lua 脚本 + Stream + Bitmap 布隆 |
 | 本地缓存 | Caffeine | 售罄标记，5s TTL |
 | 消息队列 | RabbitMQ 3.13 (Alpine) | 4 个 Queue，异步兜底 ZSET/VO 更新 |
@@ -299,7 +341,7 @@ npm run dev
 | GET | /api/v1/note/recommend-feed?cursor=&pageSize= | **推荐流（布隆消重 + 无限滚动）** |
 | GET | /api/v1/note/following-feed?cursor=&pageSize= | **关注流（推拉结合，需登录）** |
 | GET | /api/v1/note/my-notes?cursor=&pageSize= | 我的笔记 |
-| POST | /api/v1/note/create | 发布笔记（触发 fanout） |
+| POST | /api/v1/note/create | 发布笔记（支持 eventIds 关联活动种草） |
 | POST | /api/v1/note/{id}/like | 点赞 |
 | GET | /api/v1/note/{id}/comment | 评论列表（二级展平） |
 | POST | /api/v1/user/{id}/follow | 关注用户（触发回填） |
@@ -311,7 +353,7 @@ npm run dev
 
 ```
 ├── backend/                                # Spring Boot 后端
-│   ├── init.sql                            # 建表 + 测试数据（10表 / 100用户 / 200笔记）
+│   ├── init.sql                            # 建表 + 测试数据（11表 / 100用户 / 200笔记 / 10种草关联）
 │   └── src/main/
 │       ├── resources/scripts/
 │       │   ├── purchase.lua                # 抢购 Lua：原子扣库存 + 限购 + Stream
@@ -354,9 +396,9 @@ npm run dev
 
 ## 🗄️ 数据库
 
-10 张表：`user` → `event` → `ticket_category` → `order` → `order_event_log` → `refund` → `user_follow` → `user_note` → `user_note_comment` → `note_like`
+11 张表：`user` → `event` → `ticket_category` → `order` → `order_event_log` → `refund` → `user_follow` → `user_note` → `user_note_comment` → `note_like` → `note_event`
 
-测试数据：100 用户 · 15 活动 · 44 票档 · 200 笔记 · 295 关注 · 496 点赞
+测试数据：100 用户 · 15 活动 · 44 票档 · 200 笔记 · 295 关注 · 496 点赞 · 10 种草关联
 
 ## 许可证
 

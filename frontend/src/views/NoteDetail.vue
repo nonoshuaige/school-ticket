@@ -28,6 +28,19 @@
         </div>
       </div>
 
+      <!-- 种草活动 -->
+      <div v-if="note.events && note.events.length > 0" class="linked-events">
+        <div class="linked-events-header">🛍️ 种草好物</div>
+        <div class="linked-events-list">
+          <EventCard
+            v-for="evt in note.events"
+            :key="evt.eventId"
+            :event="evt"
+            @click="goEvent(evt.eventId)"
+          />
+        </div>
+      </div>
+
       <!-- 评论区域 -->
       <div class="comment-section">
         <div class="comment-section-header">
@@ -128,12 +141,14 @@
 
 <script setup>
 import { ref, computed, onMounted } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { showToast, showConfirmDialog } from 'vant'
 import { getNoteDetail, likeNote, unlikeNote, getComments, createComment, deleteComment } from '../api/note'
 import { useUserStore } from '../stores/user'
+import EventCard from '../components/EventCard.vue'
 
 const route = useRoute()
+const router = useRouter()
 const userStore = useUserStore()
 const noteId = Number(route.params.id)
 
@@ -167,6 +182,10 @@ const emojis = ['🌸','🎵','📖','🍔','🏃','📷','🎮','✨','🌈','�
 
 const coverGradient = computed(() => gradients[noteId % gradients.length])
 const coverEmoji = computed(() => emojis[noteId % emojis.length])
+
+function goEvent(eventId) {
+  router.push(`/event/${eventId}`)
+}
 
 function formatTime(dateStr) {
   if (!dateStr) return ''
@@ -337,6 +356,19 @@ onMounted(() => {
   font-size: 14px;
 }
 .detail-like.liked { color: #ee0a24; }
+
+.linked-events { margin: 12px 12px 0; }
+.linked-events-header {
+  font-size: 14px;
+  font-weight: 600;
+  color: #333;
+  margin-bottom: 8px;
+}
+.linked-events-list {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
 
 .comment-section { margin: 0 12px; }
 .comment-section-header {

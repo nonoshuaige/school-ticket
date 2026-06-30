@@ -16,8 +16,12 @@ export function getNoteDetail(noteId) {
   return request.get(`/note/${noteId}`)
 }
 
-export function createNote(content) {
-  return request.post('/note/create', { content })
+export function createNote(content, eventIds) {
+  const body = { content }
+  if (eventIds && eventIds.length > 0) {
+    body.eventIds = eventIds
+  }
+  return request.post('/note/create', body)
 }
 
 export function likeNote(noteId) {

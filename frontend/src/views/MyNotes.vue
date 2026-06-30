@@ -6,6 +6,7 @@
         <div v-for="item in notes" :key="item.noteId" class="note-card" @click="goDetail(item.noteId)">
           <div class="note-cover" :style="{ background: coverGradient(item.noteId) }">
             <span class="cover-emoji">{{ coverEmoji(item.noteId) }}</span>
+            <span v-if="item.eventIds && item.eventIds.length > 0" class="zhongcao-badge">🛍️ 种草</span>
           </div>
           <div class="note-body">
             <div class="note-content">{{ item.content }}</div>
@@ -141,8 +142,21 @@ onMounted(() => { loadNotes() })
   display: flex;
   align-items: center;
   justify-content: center;
+  position: relative;
 }
 .cover-emoji { font-size: 40px; }
+.zhongcao-badge {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  background: rgba(255, 107, 53, 0.9);
+  color: #fff;
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-weight: 500;
+  white-space: nowrap;
+}
 .note-body { padding: 8px 10px; }
 .note-content {
   font-size: 12px;

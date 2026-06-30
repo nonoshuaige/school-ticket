@@ -8,7 +8,8 @@ import com.schoolticket.note.service.NoteService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
-import java.util.Map;
+import java.util.*;
+import java.util.stream.Collectors;
 
 @RestController
 @RequestMapping("/api/v1/note")
@@ -59,7 +60,15 @@ public class NoteController {
         if (content.length() > 500) {
             throw new BusinessException(400, "内容不能超过500字");
         }
-        return Result.success(noteService.createNote(userId, content.trim()));
+        // 解析可选 eventIds
+        List<Long> eventIds = null;
+        Object eidsObj = body.get("eventIds");
+        if (eidsObj instanceof List<?> list && !list.isEmpty()) {
+            eventIds = list.stream()
+                    .map(o -> ((Number) o).longValue())
+                    .collect(Collectors.toList());
+        }
+        return Result.success(noteService.createNote(userId, content.trim(), eventIds));
     }
 
     @GetMapping("/{noteId}")

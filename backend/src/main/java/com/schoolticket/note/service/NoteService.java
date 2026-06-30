@@ -3,8 +3,11 @@ package com.schoolticket.note.service;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.schoolticket.common.BusinessException;
 import com.schoolticket.dto.CursorPage;
+import com.schoolticket.event.service.EventService;
 import com.schoolticket.note.entity.Note;
+import com.schoolticket.note.entity.NoteEvent;
 import com.schoolticket.note.entity.NoteLike;
+import com.schoolticket.note.mapper.NoteEventMapper;
 import com.schoolticket.note.mapper.NoteLikeMapper;
 import com.schoolticket.note.mapper.NoteMapper;
 import com.schoolticket.user.entity.User;
@@ -38,6 +41,8 @@ public class NoteService {
     private final BloomFilterService bloomFilterService;
     private final RabbitTemplate rabbitTemplate;
     private final StringRedisTemplate redis;
+    private final NoteEventMapper noteEventMapper;
+    private final EventService eventService;
 
     private static final String FEED_KEY = "feed:recommend:%d";
     private static final String FEED_FOLLOWING_KEY = "feed:following:%d";
@@ -217,17 +222,52 @@ public class NoteService {
 
     public CursorPage<Map<String, Object>> myNotes(Long userId, Long cursor, int pageSize) {
         noteRankingService.ensureMineLoaded(userId);
-        return noteRankingService.getMine(userId, cursor, pageSize, userId);
+        CursorPage<Map<String, Object>> page = noteRankingService.getMine(userId, cursor, pageSize, userId);
+        // 补充关联活动信息
+        if (!page.getRecords().isEmpty()) {
+            List<Long> noteIds = page.getRecords().stream()
+                    .map(m -> (Long) m.get("noteId")).collect(Collectors.toList());
+            Map<Long, List<Long>> noteEventMap = batchGetNoteEventIdsWithRepair(noteIds);
+            Set<Long> allEventIds = noteEventMap.values().stream()
+                    .flatMap(List::stream).collect(Collectors.toSet());
+            Map<Long, Map<String, Object>> eventSummaries = Collections.emptyMap();
+            if (!allEventIds.isEmpty()) {
+                eventSummaries = eventService.batchGetEventSummaries(new ArrayList<>(allEventIds));
+            }
+            for (Map<String, Object> vo : page.getRecords()) {
+                Long nid = (Long) vo.get("noteId");
+                List<Long> eids = noteEventMap.getOrDefault(nid, Collections.emptyList());
+                vo.put("eventIds", eids);
+                vo.put("events", eids.stream()
+                        .map(eventSummaries::get)
+                        .filter(Objects::nonNull)
+                        .collect(Collectors.toList()));
+            }
+        }
+        return page;
     }
 
     // ==================== 笔记 CRUD ====================
 
     @Transactional
-    public Note createNote(Long userId, String content) {
+    public Note createNote(Long userId, String content, List<Long> eventIds) {
         Note note = new Note();
         note.setUserId(userId);
         note.setContent(content);
         noteMapper.insert(note);
+
+        // 0.5. 写入 note→event 关联
+        if (eventIds != null && !eventIds.isEmpty()) {
+            for (Long eid : eventIds) {
+                NoteEvent ne = new NoteEvent();
+                ne.setNoteId(note.getNoteId());
+                ne.setEventId(eid);
+                noteEventMapper.insert(ne);
+            }
+            noteRankingService.cacheNoteEvents(note.getNoteId(), eventIds);
+        } else {
+            noteRankingService.cacheNoteEvents(note.getNoteId(), Collections.emptyList());
+        }
 
         // 1. 写入 VO 缓存
         writeNoteVOToCache(note);
@@ -271,6 +311,11 @@ public class NoteService {
 
         // MyBatis-Plus @TableLogic: deleteById → UPDATE is_deleted = 1
         noteMapper.deleteById(noteId);
+
+        // 清除 note_event 关联 + Redis 缓存
+        noteEventMapper.delete(
+                new LambdaQueryWrapper<NoteEvent>().eq(NoteEvent::getNoteId, noteId));
+        noteRankingService.deleteNoteEventsCache(noteId);
 
         // 清除 VO 缓存
         noteRankingService.deleteNoteVO(noteId);
@@ -316,6 +361,18 @@ public class NoteService {
             vo.put("userId", author.getUserId());
             vo.put("nickname", author.getNickname());
             vo.put("phone", author.getPhone());
+        }
+
+        // 关联活动
+        List<NoteEvent> neList = noteEventMapper.selectList(
+                new LambdaQueryWrapper<NoteEvent>().eq(NoteEvent::getNoteId, noteId));
+        List<Long> eventIds = neList.stream().map(NoteEvent::getEventId).collect(Collectors.toList());
+        vo.put("eventIds", eventIds);
+        if (!eventIds.isEmpty()) {
+            vo.put("events", new ArrayList<>(
+                    eventService.batchGetEventSummaries(eventIds).values()));
+        } else {
+            vo.put("events", Collections.emptyList());
         }
         return vo;
     }
@@ -446,6 +503,16 @@ public class NoteService {
             }
         }
 
+        // 3.5. 批量加载笔记关联活动（按需懒加载）
+        List<Long> validIds = noteIds.stream().filter(cachedVOs::containsKey).collect(Collectors.toList());
+        Map<Long, List<Long>> noteEventMap = batchGetNoteEventIdsWithRepair(validIds);
+        Set<Long> allEventIds = noteEventMap.values().stream()
+                .flatMap(List::stream).collect(Collectors.toSet());
+        Map<Long, Map<String, Object>> eventSummaries = Collections.emptyMap();
+        if (!allEventIds.isEmpty()) {
+            eventSummaries = eventService.batchGetEventSummaries(new ArrayList<>(allEventIds));
+        }
+
         // 4. 按原始顺序组装
         List<Map<String, Object>> records = new ArrayList<>();
         for (Long nid : noteIds) {
@@ -461,9 +528,53 @@ public class NoteService {
             vo.put("userId", Long.parseLong(fields.get("userId")));
             vo.put("nickname", fields.get("nickname"));
             vo.put("phone", fields.get("phone"));
+            // 关联活动
+            List<Long> eids = noteEventMap.getOrDefault(nid, Collections.emptyList());
+            vo.put("eventIds", eids);
+            List<Map<String, Object>> events = eids.stream()
+                    .map(eventSummaries::get)
+                    .filter(Objects::nonNull)
+                    .collect(Collectors.toList());
+            vo.put("events", events);
             records.add(vo);
         }
         return records;
+    }
+
+    /**
+     * 批量加载笔记的事件关联（按需懒加载）
+     * Redis pipeline GET → miss 查 MySQL → 回填 Redis
+     */
+    private Map<Long, List<Long>> batchGetNoteEventIdsWithRepair(List<Long> noteIds) {
+        if (noteIds.isEmpty()) return Collections.emptyMap();
+
+        // 1. 尝试 Redis pipeline GET
+        Map<Long, List<Long>> result = new LinkedHashMap<>(
+                noteRankingService.batchGetNoteEventIds(noteIds));
+
+        // 2. 未命中（miss 的 key 不在 result 中，区分"无关联"和"未缓存"）
+        // 对 result 中已有的 key 直接返回（包括空列表——缓存过"无关联"的）
+        List<Long> missIds = noteIds.stream()
+                .filter(nid -> !result.containsKey(nid))
+                .collect(Collectors.toList());
+
+        if (!missIds.isEmpty()) {
+            List<NoteEvent> allRows = noteEventMapper.selectList(
+                    new LambdaQueryWrapper<NoteEvent>().in(NoteEvent::getNoteId, missIds));
+
+            Map<Long, List<Long>> dbMap = new HashMap<>();
+            for (NoteEvent ne : allRows) {
+                dbMap.computeIfAbsent(ne.getNoteId(), k -> new ArrayList<>())
+                      .add(ne.getEventId());
+            }
+
+            for (Long nid : missIds) {
+                List<Long> eids = dbMap.getOrDefault(nid, Collections.emptyList());
+                noteRankingService.cacheNoteEvents(nid, eids);
+                result.put(nid, eids);
+            }
+        }
+        return result;
     }
 
     private void writeNoteVOToCache(Note note) {

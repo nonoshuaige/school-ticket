@@ -41,6 +41,54 @@ public class RedisNoteRankingService {
     private static final long   USER_LIKES_TTL_SECONDS = 259200;
     private static final long   FOLLOW_FEED_TTL_SECONDS = 259200;
 
+    // ==================== 笔记关联活动缓存（note:events:{noteId}） ====================
+
+    private static final String NOTE_EVENTS_KEY = "note:events:%d";
+    private static final long   NOTE_EVENTS_TTL_SECONDS = 7 * 24 * 3600; // 7天，与 VO 一致
+
+    /** 缓存笔记关联的活动 ID 列表（逗号分隔字符串，空串表示无关联） */
+    public void cacheNoteEvents(Long noteId, List<Long> eventIds) {
+        String key = String.format(NOTE_EVENTS_KEY, noteId);
+        String val = eventIds == null || eventIds.isEmpty() ? ""
+                : eventIds.stream().map(String::valueOf).collect(java.util.stream.Collectors.joining(","));
+        redis.opsForValue().set(key, val, NOTE_EVENTS_TTL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    /** 批量获取笔记关联的活动 ID（pipeline GET），返回 noteId → eventId 列表（miss 的不在 map 中）*/
+    public Map<Long, List<Long>> batchGetNoteEventIds(List<Long> noteIds) {
+        Map<Long, List<Long>> result = new LinkedHashMap<>();
+        if (noteIds.isEmpty()) return result;
+
+        List<byte[]> rawKeys = new ArrayList<>();
+        for (Long nid : noteIds) {
+            rawKeys.add(String.format(NOTE_EVENTS_KEY, nid).getBytes(StandardCharsets.UTF_8));
+        }
+
+        List<Object> results = redis.executePipelined(
+                (org.springframework.data.redis.connection.RedisConnection connection) -> {
+            for (byte[] key : rawKeys) {
+                connection.stringCommands().get(key);
+            }
+            return null;
+        });
+
+        for (int i = 0; i < noteIds.size(); i++) {
+            Object obj = results.get(i);
+            if (obj instanceof String s && !s.isEmpty()) {
+                List<Long> eventIds = java.util.Arrays.stream(s.split(","))
+                        .map(Long::valueOf)
+                        .collect(java.util.stream.Collectors.toList());
+                result.put(noteIds.get(i), eventIds);
+            }
+        }
+        return result;
+    }
+
+    /** 删除笔记关联活动缓存 */
+    public void deleteNoteEventsCache(Long noteId) {
+        redis.delete(String.format(NOTE_EVENTS_KEY, noteId));
+    }
+
     // ==================== 写入 ====================
 
     /** 发布笔记时加入 latest ZSET 和自己的 mine ZSET */
