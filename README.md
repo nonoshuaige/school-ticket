@@ -8,60 +8,64 @@
 
 ## 🎯 核心亮点
 
-### 一、秒杀抢购链路 — Redis Lua 原子操作 + Caffeine 本地售罄 + Stream 异步落库 + 本地消息表可靠回滚
+### 一、秒杀抢购链路 — Lua 原子操作 + Caffeine 售罄短路 + Stream 出箱 + RabbitMQ 可靠落库 + 本地消息表回滚
 
 ```
-用户请求
+用户请求 POST /order/create { ticketId, quantity, idempotencyKey }
   │
   ├─ 0. 幂等保护（v3.10）
-  │      ├─ 前端生成 UUID 幂等键，携带于请求体
-  │      ├─ Redis SET NX EX 300 原子抢占 idempotent:order:{key} = "PENDING"
-  │      ├─ 抢占失败 → GET key = orderNo? → 幂等返回已有订单
-  │      └─ 抢占失败 → GET key = "PENDING"? → 409 "请求处理中"
+  │      ├─ 前端生成 UUID 幂等键
+  │      ├─ Redis SET NX EX 300 抢占 idempotent:order:{key} = "PENDING"
+  │      ├─ 已存在 = orderNo → 查 MySQL 幂等返回
+  │      └─ 已存在 = "PENDING" → 409 "请求处理中"
   │
   ├─ 1. Caffeine 本地缓存短路（5s TTL）
-  │      └─ soldOut=true → 释放幂等键，返回"已售罄"
+  │      └─ soldOut=true → 返回"已售罄"
   │
-  ├─ 2. 无锁 selectById 查票档/活动信息
+  ├─ 2. 无锁 selectById 查票档 + 活动信息
   │
-  ├─ 3. Snowflake 预生成订单号（IdUtil.getSnowflakeNextIdStr）
+  ├─ 3. Snowflake 预生成订单号
   │
-  ├─ 4. purchase.lua 原子执行（单次 Redis 往返）:
-  │      ├─ GET soldout → 已售罄? 返回 -1
-  │      ├─ GET stock < qty? → SET soldout=1 EX 300 → 返回 -2
-  │      ├─ 跨票档检查 → 同活动其他票档有购买? → 返回 -4
-  │      ├─ HGET purchase userId → 本票档 > 5张? → 返回 -3
-  │      ├─ DECRBY stock qty
-  │      ├─ HINCRBY purchase userId qty
-  │      └─ XADD stream:orders * orderId userId ticketId qty price expireTime
+  ├─ 4. purchase.lua 原子执行:
+  │      ├─ GET soldout → 已售罄? → -1
+  │      ├─ GET stock < qty? → SET soldout=1 → -2
+  │      ├─ 跨票档 HGET 检查 → 已购其他票档? → -4
+  │      ├─ HGET purchase userId → > 5 张? → -3
+  │      ├─ DECRBY stock
+  │      ├─ HINCRBY purchase
+  │      └─ XADD stream:orders (唯一写路径)
   │
-  ├─ 5. Lua 返回 0 → INSERT MySQL（前端立即可见）
-  │      ├─ 成功 → SET idempotent:order:{key} = orderNo
-  │      └─ DuplicateKeyException → Stream 先落库 → 幂等返回已有订单
-  │
-  └─ 6. 正向链路完成
-        │
-        ▼
+  ├─ 5. Lua 成功 → SET idempotent:order:{key} = orderNo
+  │      返回 stub Order（主线程不再直接 INSERT MySQL）
+  │      │
+  │      ▼
+  │  StreamToRabbitMQBridge (每 200ms, v4.1)
+  │      │  XREADGROUP → publish RabbitMQ (order.create) → XACK
+  │      │
+  │      │  PEL 兜底 (每 5s): XPENDING → 卡住 >5s → 重投 RabbitMQ → XACK
+  │      │
+  │      ▼
+  │  OrderCreateConsumer @RabbitListener
+  │      │  INSERT MySQL (唯一落库路径)
+  │      │  DuplicateKeyException → 幂等跳过
+  │      │  异常 → 抛回 RabbitMQ 重试 / DXL
+  │      │
+  │      ▼ 落库完成，前端轮询 GET /order/{orderNo} 获取完整信息
+  
   逆向链路（取消/超时关单 / 退款）:
     cancel / expire
       │
-      ├─ 1. MySQL 事务内: UPDATE order status + 回补 remaining
+      ├─ MySQL 事务内: UPDATE order status + 回补 remaining
       │         └─ INSERT order_event_log (status=0)
-      │              → OrderEventLogTask 每 10s 扫描 → rollback.lua → ack status=1
-      │
-      └─ 2. Caffeine invalidate
+      │              → OrderEventLogTask 每 10s → rollback.lua → ack
+      └─ Caffeine invalidate
 
     refund
       │
-      ├─ 1. INSERT refund (status=0 待退款) → 立即返回
-      │
-      ├─ 2. RefundTask 每 10s 扫描 refund status=0
-      │      └─ processRefund: 回补 remaining + order status=3
-      │            + INSERT order_event_log (驱动 Redis 回滚)
-      │            + Caffeine invalidate
-      │      └─ 成功 → refund status=1 / 失败 → status=2
-      │
-      └─ 3. OrderEventLogTask 消费 event_log → rollback.lua → ack
+      ├─ INSERT refund (status=0) → 立即返回
+      ├─ RefundTask 每 10s 消费 → 回补 + UPDATE status=3
+      │         └─ INSERT order_event_log → 驱动 Redis 回滚
+      └─ Caffeine invalidate
 ```
 
 **关键技术决策：**
@@ -74,10 +78,11 @@
 | 售罄后无效请求穿透 Redis | Caffeine 本地缓存 `Cache<Long, Boolean>`，5s TTL，仅存售罄=true | 秒级短路，Redis 压力归零 |
 | 订单号全局唯一 | Hutool Snowflake（无中心化依赖） | 预生成，不依赖 DB 自增 |
 | 重复提交/网络重试 | Redis SET NX EX 300 原子抢占幂等键 + DuplicateKeyException 兜底 | 同一次请求仅创建一个订单 |
-| 缓存/DB 一致性 | 前端订单直插 MySQL + Stream Consumer 异步幂等兜底 | 前端立即可见，双重保障 |
+| Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，RabbitMQ 持久化队列单路径落库（v4.1） | 磁盘级可靠，消息不因 Redis 重启丢失 |
+| 活动缓存击穿 | 逻辑过期 + 互斥锁（SET NX），物理 TTL=逻辑+30min 缓冲，过期返回旧值异步重建（v4.1） | 大量并发不再穿透 DB |
 | 库存恢复 | rollback.lua 原子 INCRBY + DEL soldout + 减少购买记录 | 取消/退款秒级回补 |
-| 逆向链路可靠性 | 本地消息表 `order_event_log`（与业务在同一事务内 INSERT）→ 定时任务扫描 status=0 → 执行 Lua → 成功 ack status=1，失败重试最多 5 次 | Redis 临时不可用时不影响业务返回，最终一致 |
-| 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask 消费执行实际退款 → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，削峰填谷 |
+| 逆向链路可靠性 | 本地消息表 `order_event_log`（与业务在同一事务内 INSERT）→ 定时任务扫描 → 执行 Lua → 成功 ack，失败重试最多 5 次 | Redis 临时不可用时不影响返回，最终一致 |
+| 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask 消费执行 → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，削峰填谷 |
 | Caffeine 失效时机 | 取消/超时/退款执行时立即 invalidate，不等 Redis 回滚完成 | 用户感知的售罄状态即时更新 |
 
 **Caffeine 本地售罄缓存：**
@@ -93,17 +98,18 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 **库存预热：** 热卖中活动的票档库存预先写入 Redis `ticket:stock:{ticketId}` Key，TTL=活动结束时间，Lua 执行 DECRBY 无需回源 MySQL。
 
-**活动信息缓存（v3.9 / v3.12 完善）：** 活动列表和详情查询改为 Redis 优先、MySQL 兜底。启动时将所有活跃活动（热卖+预热）预热到 Redis，前端按热卖/预热 Tab 分开展示。v3.12 将 status 改为实时计算字段（基于 saleStartTime/saleEndTime vs 当前时间），消除 DB 状态与时间窗口不同步问题；MySQL 兜底路径补全 saleStartTime ≤ now 条件，确保热卖/预热精确分流。
+**活动信息缓存（v3.9 / v3.12 / v4.1 逻辑过期）：** 活动列表和详情查询改为 Redis 优先、MySQL 兜底。v4.1 引入逻辑过期 + 互斥锁防击穿：缓存 value 包裹 `{"expireAt":...,"data":{...}}`，物理 TTL=逻辑过期+30min 缓冲。逻辑过期时返回旧值并异步重建，大量并发不再穿透 DB。v3.12 将 status 改为实时计算字段。
 
-| Redis Key | 类型 | TTL | 用途 |
-|-----------|------|-----|------|
-| `idempotent:order:{key}` | String | 300s | 幂等键 → "PENDING" 或 orderNo，防重复提交 |
-| `event:pool:hot` | ZSET | saleEndTime | 热卖中活动 ID，score=eventStartTime |
-| `event:pool:warmup` | ZSET | max(saleStartTime)+1d | 预热中活动 ID，score=eventStartTime |
-| `event:vo:{eventId}` | String (JSON) | saleEndTime | 活动完整信息 + 预计算 minPrice |
-| `event:tickets:{eventId}` | String (JSON) | saleEndTime | 票档列表 JSON |
+| Redis Key | 类型 | 物理TTL | 逻辑过期 | 用途 |
+|-----------|------|---------|---------|------|
+| `idempotent:order:{key}` | String | 300s | — | 幂等键 → "PENDING" 或 orderNo |
+| `event:pool:hot` | ZSET | max(saleEndTime)+30min | 每5min 重建 | 热卖中活动 ID，score=eventStartTime |
+| `event:pool:warmup` | ZSET | max(saleStartTime)+1d+30min | 每5min 重建 | 预热中活动 ID |
+| `event:vo:{eventId}` | String (JSON) | logicExpire+30min | saleEndTime(热) / saleStartTime(预) | 活动完整信息 + minPrice |
+| `event:tickets:{eventId}` | String (JSON) | logicExpire+30min | 同上 | 票档列表 JSON |
+| `mutex:event:pool:{status}` | String | 10s | — | Pool 互斥锁，防并发重建 |
 
-查询路径：页面请求 → Redis ZSET 分页 → HGETALL VO 缓存 → 直接返回（不碰 MySQL）。VO miss / pool 脏数据自动从 MySQL 回填并修复。
+查询路径：Pool key 存在且未逻辑过期 → 直接返回。逻辑过期 → 抢锁异步重建 + 返回旧值。Pool 缺失 → 抢锁同步重建。
 
 ---
 
@@ -251,7 +257,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | 数据库 | MySQL 8.0 | 11 张表，100 用户 / 15 活动 / 200 笔记 / 10 种草关联 |
 | 缓存 | Redis 7.4 (Alpine) | ZSET 游标分页 + Lua 脚本 + Stream + Bitmap 布隆 |
 | 本地缓存 | Caffeine | 售罄标记，5s TTL |
-| 消息队列 | RabbitMQ 3.13 (Alpine) | 4 个 Queue，异步兜底 ZSET/VO 更新 |
+| 消息队列 | RabbitMQ 3.13 (Alpine) | 5 个 Queue（4 个笔记+关注 + 1 个订单创建），异步兜底 + 可靠落库 |
 | 容器 | Docker Desktop | Redis + RabbitMQ |
 
 ---
@@ -367,7 +373,8 @@ npm run dev
 │           │   ├── mapper/RefundMapper.java
 │           │   ├── service/OrderService.java       # 抢购编排 + 写消息表/退款表
 │           │   ├── service/OrderLuaService.java    # Lua 执行 + 库存预热
-│           │   ├── consumer/OrderStreamConsumer.java # Stream 异步落库
+│           │   ├── consumer/StreamToRabbitMQBridge.java # Stream→RabbitMQ 桥接 + PEL 兜底
+│           │   ├── consumer/OrderCreateConsumer.java    # RabbitMQ 消费者，唯一落库路径
 │           │   ├── cache/SoldOutCache.java         # Caffeine 售罄缓存
 │           │   ├── task/OrderTimeoutTask.java      # 超时关单扫描
 │           │   ├── task/OrderEventLogTask.java     # 本地消息表定时处理

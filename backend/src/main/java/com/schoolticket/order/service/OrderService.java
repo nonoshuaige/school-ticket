@@ -21,7 +21,6 @@ import com.schoolticket.order.mapper.OrderMapper;
 import com.schoolticket.order.mapper.RefundMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -52,21 +51,27 @@ public class OrderService {
     // ===================== 核心履约 =====================
 
     /**
-     * 创建订单（幂等保护 + Redis Lua 原子扣库存 + 本地售罄缓存 + Stream 异步落库）
+     * 创建订单（幂等保护 + Redis Lua 原子扣库存 + Stream 写入 + RabbitMQ 异步落库）
+     *
+     * 主线程只做 Lua（含 XADD stream），不再直接 INSERT MySQL。
+     * StreamToRabbitMQBridge → RabbitMQ → OrderCreateConsumer 是唯⼀落库路径。
      */
-    @Transactional
     public Order createOrder(Long userId, OrderCreateReq req) {
         // 0. 幂等保护：检查是否已处理过此请求
         String existing = orderLuaService.getIdempotentResult(req.getIdempotencyKey());
-        if (existing != null && !"PENDING".equals(existing)) {
+        if (existing != null) {
+            if ("PENDING".equals(existing)) {
+                throw new BusinessException(409, "请求处理中，请勿重复提交");
+            }
+            // existing = orderNo → 查询 MySQL（可能尚未异步落库）
             Order cached = orderMapper.selectOne(
                     new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, existing));
             if (cached != null) {
                 log.info("幂等命中: idempotencyKey={}, orderNo={}", req.getIdempotencyKey(), existing);
                 return cached;
             }
-            // 键指向的订单不存在（异常情况），清理后继续
-            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
+            // 异步落库尚未完成 → 返回 stub 对象，前端可轮询 GET /order/{orderNo}
+            return buildStubOrder(existing, userId, req);
         }
 
         // 原子抢占幂等键，失败 = 并发冲突
@@ -76,6 +81,7 @@ public class OrderService {
                 Order cached = orderMapper.selectOne(
                         new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, existing));
                 if (cached != null) return cached;
+                return buildStubOrder(existing, userId, req);
             }
             throw new BusinessException(409, "请求处理中，请勿重复提交");
         }
@@ -108,7 +114,7 @@ public class OrderService {
                     new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, event.getEventId()))
                     .stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
 
-            // 5. 执行 Lua 脚本
+            // 5. 执行 Lua 脚本（原子: 扣库存 + 限购 + XADD stream）
             List<Object> result = orderLuaService.executePurchase(
                     req.getTicketId(), userId, event.getEventId(), orderNo,
                     req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs,
@@ -128,44 +134,31 @@ public class OrderService {
                 throw new BusinessException("该活动您已购买其他票档，每个活动只能购买一类票");
             }
 
-            // 6. 落库
-            Order order = new Order();
-            order.setOrderNo(orderNo);
-            order.setUserId(userId);
-            order.setTicketId(req.getTicketId());
-            order.setQuantity(req.getQuantity());
-            order.setTotalPrice(totalPrice);
-            order.setStatus(0);
-            order.setExpireTime(LocalDateTime.now().plusMinutes(EXPIRE_MINUTES));
-            orderMapper.insert(order);
-
-            // 成功：幂等键指向订单号
+            // 6. Lua 成功 → 幂等键指向订单号，返回 stub（落库由 RabbitMQ 消费者异步完成）
             orderLuaService.completeIdempotentKey(req.getIdempotencyKey(), orderNo);
-            log.info("订单创建: orderNo={}, userId={}, ticketId={}, qty={}",
+            log.info("订单创建(Stream): orderNo={}, userId={}, ticketId={}, qty={}",
                     orderNo, userId, req.getTicketId(), req.getQuantity());
-            return order;
+            return buildStubOrder(orderNo, userId, req);
 
         } catch (BusinessException e) {
-            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
-            throw e;
-        } catch (DuplicateKeyException e) {
-            // Stream Consumer 先一步插入，主线程 INSERT 冲突 → 幂等返回已有订单
-            Order dupOrder = orderMapper.selectOne(
-                    new LambdaQueryWrapper<Order>().eq(Order::getUserId, userId)
-                            .eq(Order::getTicketId, req.getTicketId())
-                            .orderByDesc(Order::getCreateTime)
-                            .last("LIMIT 1"));
-            if (dupOrder != null) {
-                orderLuaService.completeIdempotentKey(req.getIdempotencyKey(), dupOrder.getOrderNo());
-                log.info("Stream 已落库，幂等返回: orderNo={}", dupOrder.getOrderNo());
-                return dupOrder;
-            }
             orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
             throw e;
         } catch (Exception e) {
             orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
             throw e;
         }
+    }
+
+    private Order buildStubOrder(String orderNo, Long userId, OrderCreateReq req) {
+        Order order = new Order();
+        order.setOrderNo(orderNo);
+        order.setUserId(userId);
+        order.setTicketId(req.getTicketId());
+        order.setQuantity(req.getQuantity());
+        order.setTotalPrice(null); // 需查 DB 才有精确值
+        order.setStatus(0);
+        order.setExpireTime(LocalDateTime.now().plusMinutes(EXPIRE_MINUTES));
+        return order;
     }
 
     /**
