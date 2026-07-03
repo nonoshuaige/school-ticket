@@ -8,19 +8,21 @@
 
 ## 🎯 核心亮点
 
-### 一、秒杀抢购链路 — Lua 原子操作 + Caffeine 售罄短路 + Stream 出箱 + RabbitMQ 可靠落库 + 本地消息表回滚
+### 一、秒杀抢购链路 — Lua 原子操作 + 防重提交 + Caffeine 单飞锁 + 阻塞队列桥接 + RabbitMQ 可靠落库 + 本地消息表回滚
 
 ```
-用户请求 POST /order/create { ticketId, quantity }（前端按钮 1s 防连点）
+用户请求 POST /order/create { ticketId, quantity }
   │
-  ├─ 1. Caffeine 本地缓存短路（5s TTL）
-  │      └─ soldOut=true → 返回"已售罄"
+  ├─ 1. Caffeine 本地售罄短路 + 单飞锁（5s TTL）
+  │      ├─ 命中 → 返回"已售罄"
+  │      └─ 未命中 → per-key 锁 → 单线程查 Redis soldout 标记 → 更新 Caffeine
   │
   ├─ 2. 无锁 selectById 查票档 + 活动信息
   │
   ├─ 3. Snowflake 预生成订单号
   │
   ├─ 4. purchase.lua 原子执行:
+  │      ├─ SET dedup:order:{userId}:{ticketId} EX 1 NX → 防重提交 → -4
   │      ├─ GET soldout → 已售罄? → -1
   │      ├─ GET stock < qty? → SET soldout=1 → -2
   │      ├─ HGET event:purchase:{eventId} userId → current+qty > 5? → -3
@@ -34,8 +36,9 @@
   │      返回 stub Order（主线程不再直接 INSERT MySQL）
   │      │
   │      ▼
-  │  StreamToRabbitMQBridge (每 200ms, v4.1)
-  │      │  XREADGROUP → publish RabbitMQ (order.create) → XACK
+  │  StreamToRabbitMQBridge (阻塞队列, v4.4)
+  │      │  Reader 线程 XREAD BLOCK → LinkedBlockingQueue
+  │      │  Worker×4 take() → publish RabbitMQ → XACK
   │      │
   │      │  PEL 兜底 (每 5s): XPENDING → 卡住 >5s → 重投 RabbitMQ → XACK
   │      │
@@ -54,14 +57,14 @@
       ├─ MySQL 事务内: UPDATE order status + 回补 remaining
       │         └─ INSERT order_event_log (status=0)
       │              → OrderEventLogTask 每 10s → rollback.lua → ack
-      └─ Caffeine invalidate
+      └─ Caffeine 不主动 invalidate，5s TTL 自然过期
 
     refund
       │
       ├─ INSERT refund (status=0) → 立即返回
       ├─ RefundTask 每 10s 消费 → 回补 + UPDATE status=3
       │         └─ INSERT order_event_log → 驱动 Redis 回滚
-      └─ Caffeine invalidate
+      └─ Caffeine 不主动 invalidate，5s TTL 自然过期
 ```
 
 **关键技术决策：**
@@ -73,23 +76,26 @@
 | 每人囤票 | `event:purchase:{eventId}` Hash 记录 userId→qty，活动级上限 5 张 | 杜绝脚本囤票 |
 | 售罄后无效请求穿透 Redis | Caffeine 本地缓存 `Cache<Long, Boolean>`，5s TTL，仅存售罄=true | 秒级短路，Redis 压力归零 |
 | 订单号全局唯一 | Hutool Snowflake（无中心化依赖） | 预生成，不依赖 DB 自增 |
-| 重复提交/网络重试 | 前端按钮 1s 防连点 + loading 态 | 同一次请求仅创建一个订单 |
+| 重复提交/脚本攻击 | purchase.lua 开头 SET NX `dedup:order:{userId}:{ticketId}` EX 1s | 同一用户同一票档 1s 内仅一次提交，后端原子防重 |
+| Caffeine 击穿（过期瞬间大量请求穿透到 Redis） | 单飞锁：per-ticketId synchronized 双重检查，未命中时仅一个线程查 Redis | 同类票档同一时刻仅一次 Redis 查询 |
 | Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，RabbitMQ 持久化队列单路径落库（v4.1） | 磁盘级可靠，消息不因 Redis 重启丢失 |
 | 活动缓存击穿 | 逻辑过期 + 互斥锁（SET NX），物理 TTL=逻辑+30min 缓冲，过期返回旧值异步重建（v4.1） | 大量并发不再穿透 DB |
 | 库存恢复 | rollback.lua 原子 INCRBY + DEL soldout + 减少购买记录 | 取消/退款秒级回补 |
 | 逆向链路可靠性 | 本地消息表 `order_event_log`（与业务在同一事务内 INSERT）→ 定时任务扫描 → 执行 Lua → 成功 ack，失败重试最多 5 次 | Redis 临时不可用时不影响返回，最终一致 |
 | 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask 消费执行 → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，削峰填谷 |
-| Caffeine 失效时机 | 取消/超时/退款执行时立即 invalidate，不等 Redis 回滚完成 | 用户感知的售罄状态即时更新 |
+| Caffeine 失效时机 | 不主动 invalidate，依赖 5s TTL 自然过期 + OrderEventLogTask 清除 Redis soldout 标记后缓存冷却 | 避免假售罄循环（见下方说明） |
 
-**Caffeine 本地售罄缓存：**
+**Caffeine 本地售罄缓存（v4.4 单飞锁）：**
 
 ```java
 Cache<Long, Boolean> cache = Caffeine.newBuilder()
-    .expireAfterWrite(5, TimeUnit.SECONDS)   // 5秒自动过期，售罄状态周期性刷新
+    .expireAfterWrite(5, TimeUnit.SECONDS)   // 5秒自动过期
     .maximumSize(1000)
     .build();
 // 仅缓存 soldOut=true，未命中 = 未售罄
-// 库存恢复时主动 invalidate
+// checkSoldOut(): Caffeine 命中 → 直接返回；未命中 → per-key synchronized 单线程查 Redis
+// 取消/退款不再主动 invalidate，依赖 TTL 自然过期
+// 假售罄修复：Redis soldout 标记由 OrderEventLogTask 清除，缓存过期后下次查询正确状态
 ```
 
 **库存预热：** 热卖中活动的票档库存预先写入 Redis `ticket:stock:{ticketId}` Key，TTL=活动结束时间，Lua 执行 DECRBY 无需回源 MySQL。

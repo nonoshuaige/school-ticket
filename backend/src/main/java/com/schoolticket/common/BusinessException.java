@@ -25,4 +25,5 @@ public class BusinessException extends RuntimeException {
     public static final int INVALID_PARAM = 4005;
     public static final int ALREADY_FOLLOWING = 4006;
     public static final int CANNOT_FOLLOW_SELF = 4007;
+    public static final int DUPLICATE_REQUEST = 4008;
 }

@@ -53,6 +53,8 @@ public class OrderLuaService {
      * @return [code, msg]: 0=成功, -1=售罄, -2=库存不足, -3=活动限购超限
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
+    private static final String DEDUP_KEY = "dedup:order:%d:%d";
+
     public List<Object> executePurchase(Long ticketId, Long userId, Long eventId,
                                         String orderId, int quantity, int totalStock,
                                         String totalPrice, long expireTimeMs) {
@@ -60,7 +62,8 @@ public class OrderLuaService {
                 String.format(STOCK_KEY, ticketId),
                 String.format(SOLDOUT_KEY, ticketId),
                 String.format(PURCHASE_KEY, eventId),
-                STREAM_KEY
+                STREAM_KEY,
+                String.format(DEDUP_KEY, userId, ticketId)
         );
         String[] args = {
                 orderId,

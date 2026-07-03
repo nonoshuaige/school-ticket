@@ -1,6 +1,8 @@
 package com.schoolticket.order.consumer;
 
 import com.schoolticket.config.RabbitMQConfig;
+import jakarta.annotation.PostConstruct;
+import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
@@ -10,18 +12,18 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
-import jakarta.annotation.PostConstruct;
 import java.time.Duration;
 import java.util.*;
+import java.util.concurrent.LinkedBlockingQueue;
 
 /**
  * Stream → RabbitMQ 桥接 + PEL 兜底
  *
- * 主路径: XREADGROUP 新消息 → publish RabbitMQ → XACK (每 200ms)
+ * 主路径: Reader 线程 XREAD BLOCK → LinkedBlockingQueue → Worker 线程 publish RabbitMQ → XACK
  * 兜底:   XPENDING 扫描 → XCLAIM 卡住消息 → publish RabbitMQ → XACK (每 5s)
  *
  * 设计: Lua 只能原子写 Stream, 不能调 RabbitMQ。
- *       本桥接线程将消息从 Redis 内存级可靠升级为 RabbitMQ 磁盘级可靠。
+ *       本桥接将消息从 Redis 内存级可靠升级为 RabbitMQ 磁盘级可靠。
  *       RabbitMQ Consumer 是唯⼀落库路径。
  */
 @Slf4j
@@ -35,6 +37,12 @@ public class StreamToRabbitMQBridge {
     private static final String STREAM_KEY = "stream:orders";
     private static final String GROUP = "order-consumers";
     private static final String CONSUMER = "bridge-1";
+    private static final int WORKER_COUNT = 4;
+    private static final int QUEUE_CAPACITY = 1000;
+
+    private final LinkedBlockingQueue<MapRecord<String, Object, Object>> queue =
+            new LinkedBlockingQueue<>(QUEUE_CAPACITY);
+    private volatile boolean running = true;
 
     @PostConstruct
     public void init() {
@@ -43,21 +51,59 @@ public class StreamToRabbitMQBridge {
         } catch (Exception e) {
             // Group already exists
         }
+
+        // Reader 线程：阻塞读取 Stream，投递到队列
+        Thread reader = new Thread(this::readLoop, "stream-reader");
+        reader.setDaemon(true);
+        reader.start();
+
+        // Worker 线程：从队列取出 → 发布 RabbitMQ → ACK
+        for (int i = 0; i < WORKER_COUNT; i++) {
+            Thread worker = new Thread(this::consumeLoop, "stream-worker-" + i);
+            worker.setDaemon(true);
+            worker.start();
+        }
+
+        log.info("Stream桥接已启动: reader=1, workers={}, queueCapacity={}", WORKER_COUNT, QUEUE_CAPACITY);
     }
 
-    /** 主路径: 消费新消息 → RabbitMQ → ACK */
-    @Scheduled(fixedDelay = 200)
-    public void bridgeNew() {
-        try {
-            @SuppressWarnings("unchecked")
-            List<MapRecord<String, Object, Object>> messages = redis.opsForStream()
-                    .read(Consumer.from(GROUP, CONSUMER),
-                            StreamReadOptions.empty().count(10).block(Duration.ofSeconds(1)),
-                            StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed()));
+    @PreDestroy
+    public void shutdown() {
+        running = false;
+        // 中断阻塞在队列上的线程
+        Thread.currentThread().getThreadGroup().interrupt();
+        log.info("Stream桥接已关闭");
+    }
 
-            if (messages == null || messages.isEmpty()) return;
+    /** Reader: 阻塞读取 Redis Stream，新消息投递到队列 */
+    private void readLoop() {
+        while (running) {
+            try {
+                @SuppressWarnings("unchecked")
+                List<MapRecord<String, Object, Object>> messages = redis.opsForStream()
+                        .read(Consumer.from(GROUP, CONSUMER),
+                                StreamReadOptions.empty().count(10).block(Duration.ofSeconds(2)),
+                                StreamOffset.create(STREAM_KEY, ReadOffset.lastConsumed()));
 
-            for (MapRecord<String, Object, Object> record : messages) {
+                if (messages == null || messages.isEmpty()) continue;
+
+                for (MapRecord<String, Object, Object> record : messages) {
+                    queue.put(record); // 背压：队列满时阻塞 reader
+                }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                log.error("Stream reader 异常", e);
+            }
+        }
+    }
+
+    /** Worker: 从队列取出 → RabbitMQ → ACK */
+    private void consumeLoop() {
+        while (running) {
+            try {
+                MapRecord<String, Object, Object> record = queue.take();
                 try {
                     Map<String, Object> msg = toMessageMap(record.getValue());
                     rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
@@ -67,13 +113,16 @@ public class StreamToRabbitMQBridge {
                     log.error("Bridge publish failed, will retry via PEL: entryId={}", record.getId(), e);
                     // 不 ACK，PEL 兜底会重新投递
                 }
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                break;
+            } catch (Exception e) {
+                log.error("Stream worker 异常", e);
             }
-        } catch (Exception e) {
-            log.error("bridgeNew error", e);
         }
     }
 
-    /** 兜底: 扫描 PEL 中卡住 > 5s 的消息 → XCLAIM → RabbitMQ → ACK */
+    /** 兜底: 扫描 PEL 中卡住 > 5s 的消息 → XRANGE → RabbitMQ → ACK */
     @Scheduled(fixedDelay = 5000)
     public void bridgePending() {
         try {
@@ -89,7 +138,6 @@ public class StreamToRabbitMQBridge {
             }
             if (stuckIds.isEmpty()) return;
 
-            // 直接通过 ID 字符串读取消息内容 → 投递 RabbitMQ → ACK
             for (String entryId : stuckIds) {
                 try {
                     @SuppressWarnings("unchecked")
@@ -101,7 +149,6 @@ public class StreamToRabbitMQBridge {
                         rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
                                 RabbitMQConfig.RK_ORDER_CREATE, msg);
                     }
-                    // XACK 确认（即使已 ACK 也不报错）
                     redis.opsForStream().acknowledge(STREAM_KEY, GROUP, entryId);
                     log.info("PEL 兜底投递成功: entryId={}", entryId);
                 } catch (Exception e) {

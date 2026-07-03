@@ -3,6 +3,7 @@
 -- KEYS[2]: ticket:soldout:{ticketId}
 -- KEYS[3]: event:purchase:{eventId}
 -- KEYS[4]: stream:orders
+-- KEYS[5]: dedup:order:{userId}:{ticketId}
 -- ARGV[1]: orderId
 -- ARGV[2]: userId
 -- ARGV[3]: ticketId
@@ -11,6 +12,12 @@
 -- ARGV[6]: totalStock (fallback)
 -- ARGV[7]: totalPrice
 -- ARGV[8]: expireTime (epoch ms)
+
+-- 防重：同一用户同一票档 1s 内不允许重复提交（防脚本/连点）
+local dedup = redis.call('SET', KEYS[5], '1', 'EX', 1, 'NX')
+if not dedup then
+    return {-4, 'duplicate_request'}
+end
 
 local soldout = redis.call('GET', KEYS[2])
 if soldout == '1' then

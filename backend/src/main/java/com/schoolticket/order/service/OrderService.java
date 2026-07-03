@@ -62,8 +62,8 @@ public class OrderService {
      * 防重提交由前端按钮防连点控制，后端不再做幂等保护。
      */
     public Order createOrder(Long userId, OrderCreateReq req) {
-        // 1. 本地售罄缓存短路
-        if (soldOutCache.isSoldOut(req.getTicketId())) {
+        // 1. 本地售罄缓存短路 + 单飞锁查Redis（防Caffeine过期瞬间击穿）
+        if (soldOutCache.checkSoldOut(req.getTicketId())) {
             throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
         }
 
@@ -98,6 +98,9 @@ public class OrderService {
         }
         if (code == -3) {
             throw new BusinessException("该活动累计最多购买5张");
+        }
+        if (code == -4) {
+            throw new BusinessException(BusinessException.DUPLICATE_REQUEST, "请勿重复提交订单");
         }
 
         log.info("订单创建(Stream): orderNo={}, userId={}, ticketId={}, qty={}",
@@ -158,7 +161,6 @@ public class OrderService {
         // 写本地消息表，由定时任务异步驱动 Redis Lua 回滚，保证逆向链路可靠
         writeEventLog(order, 1);
 
-        soldOutCache.invalidate(order.getTicketId());
         refreshOrderCache(orderNo, order);
         log.info("订单取消: orderNo={}", orderNo);
         return order;
@@ -214,7 +216,6 @@ public class OrderService {
         orderMapper.updateById(order);
 
         writeEventLog(order, 2);
-        soldOutCache.invalidate(order.getTicketId());
         refreshOrderCache(orderNo, order);
 
         log.info("退款执行完成: orderNo={}", orderNo);
@@ -397,7 +398,6 @@ public class OrderService {
         orderMapper.updateById(order);
 
         writeEventLog(order, 3);
-        soldOutCache.invalidate(order.getTicketId());
         refreshOrderCache(order.getOrderNo(), order);
 
         log.info("超时关单: orderNo={}", order.getOrderNo());
