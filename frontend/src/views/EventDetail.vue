@@ -32,6 +32,7 @@
       >
         <div class="ticket-left">
           <div class="ticket-name">{{ ticket.name }}</div>
+          <div class="ticket-desc" v-if="ticket.description">{{ ticket.description }}</div>
           <div class="ticket-remain" :class="{ low: ticket.remainingQuantity < 20 }">
             余 {{ ticket.remainingQuantity }} 张
           </div>
@@ -117,18 +118,14 @@ onMounted(async () => {
 function getTicketStatus(ticket) {
   if (!purchaseStatus.value) return { disabled: false, reason: '', maxQty: 5 }
   const ps = purchaseStatus.value
-  // 已购买其他票档 → 全部不可买
-  if (ps.purchasedTicketId && ps.purchasedTicketId !== ticket.ticketId) {
-    return { disabled: true, reason: '已购买其他票档', maxQty: 0 }
+  const remaining = 5 - ps.purchasedQuantity
+  // 活动累计已买满5张 → 全部票档不可买
+  if (ps.purchasedQuantity >= 5) {
+    return { disabled: true, reason: '已达活动购买上限(5张)', maxQty: 0 }
   }
-  // 该票档已买满5张
-  if (ps.purchasedTicketId === ticket.ticketId && ps.purchasedQuantity >= 5) {
-    return { disabled: true, reason: '已达购买上限', maxQty: 0 }
-  }
-  // 该票档已买部分
-  if (ps.purchasedTicketId === ticket.ticketId) {
-    const remaining = 5 - ps.purchasedQuantity
-    return { disabled: false, reason: `已购${ps.purchasedQuantity}/5张`, maxQty: remaining }
+  // 已买部分 → 所有票档均可继续购买，共用剩余额度
+  if (ps.purchasedQuantity > 0) {
+    return { disabled: false, reason: `活动已购${ps.purchasedQuantity}/5张`, maxQty: remaining }
   }
   // 未购买
   return { disabled: false, reason: '', maxQty: 5 }
@@ -171,6 +168,7 @@ function goBuy() {
 .ticket-card.disabled { opacity: .5; cursor: default; }
 .ticket-not-sale { font-size: 12px; color: #999; margin-top: 4px; }
 .ticket-name { font-size: 16px; font-weight: 600; }
+.ticket-desc { font-size: 12px; color: #999; margin-top: 2px; }
 .ticket-remain { font-size: 12px; color: #999; margin-top: 4px; }
 .ticket-remain.low { color: #f40; }
 .ticket-right { display: flex; flex-direction: column; align-items: flex-end; gap: 8px; }

@@ -1,7 +1,7 @@
--- 抢购 Lua：原子扣库存 + 限购 + 跨票档检查 + 写 Stream
+-- 抢购 Lua：原子扣库存 + 活动级限购 + 写 Stream
 -- KEYS[1]: ticket:stock:{ticketId}
 -- KEYS[2]: ticket:soldout:{ticketId}
--- KEYS[3]: ticket:purchase:{ticketId}
+-- KEYS[3]: event:purchase:{eventId}
 -- KEYS[4]: stream:orders
 -- ARGV[1]: orderId
 -- ARGV[2]: userId
@@ -11,7 +11,6 @@
 -- ARGV[6]: totalStock (fallback)
 -- ARGV[7]: totalPrice
 -- ARGV[8]: expireTime (epoch ms)
--- ARGV[9..]: other ticket IDs in the same event (for cross-category check)
 
 local soldout = redis.call('GET', KEYS[2])
 if soldout == '1' then
@@ -29,18 +28,7 @@ local maxPer = tonumber(ARGV[5])
 local userId = ARGV[2]
 local ticketId = ARGV[3]
 
--- 跨票档检查：同一活动下其他票档是否已有购买记录
-for i = 9, #ARGV do
-    local otherId = ARGV[i]
-    if otherId ~= ticketId then
-        local otherQty = tonumber(redis.call('HGET', 'ticket:purchase:' .. otherId, userId) or '0')
-        if otherQty > 0 then
-            return {-4, 'other_category_purchased'}
-        end
-    end
-end
-
--- 本票档限购检查
+-- 活动级限购检查：同一 event 下所有票档合计最多 maxPer 张
 local current = tonumber(redis.call('HGET', KEYS[3], userId) or '0')
 if current + qty > maxPer then
     return {-3, 'user_limit_exceeded'}
@@ -49,7 +37,7 @@ end
 -- 扣库存
 redis.call('DECRBY', KEYS[1], qty)
 
--- 更新用户在该票档的购买记录
+-- 更新用户在活动下的累计购买记录
 redis.call('HINCRBY', KEYS[3], userId, qty)
 
 -- 写 Stream

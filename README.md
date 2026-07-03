@@ -29,10 +29,9 @@
   ├─ 4. purchase.lua 原子执行:
   │      ├─ GET soldout → 已售罄? → -1
   │      ├─ GET stock < qty? → SET soldout=1 → -2
-  │      ├─ 跨票档 HGET 检查 → 已购其他票档? → -4
-  │      ├─ HGET purchase userId → > 5 张? → -3
+  │      ├─ HGET event:purchase:{eventId} userId → current+qty > 5? → -3
   │      ├─ DECRBY stock
-  │      ├─ HINCRBY purchase
+  │      ├─ HINCRBY event:purchase:{eventId} userId qty
   │      └─ XADD stream:orders (唯一写路径)
   │
   ├─ 5. Lua 成功 → SET idempotent:order:{key} = orderNo
@@ -73,8 +72,8 @@
 | 问题 | 方案 | 效果 |
 |------|------|------|
 | 库存超卖 | Redis Lua 原子操作（单线程执行，不可打断） | 零超卖 |
-| 同活动多票档钻空子 | Lua 内跨票档 HGET 检查，遍历同活动所有 ticketId | 每活动限买一类票档 |
-| 每人囤票 | `ticket:purchase:{ticketId}` Hash 记录 userId→qty，单票档上限 5 张 | 杜绝脚本囤票 |
+| 同活动多票档钻空子 | Lua 内 event:purchase:{eventId} Hash 活动级累计，所有票档合计 ≤5 张 | 每活动最多 5 张，可跨票档组合 |
+| 每人囤票 | `event:purchase:{eventId}` Hash 记录 userId→qty，活动级上限 5 张 | 杜绝脚本囤票 |
 | 售罄后无效请求穿透 Redis | Caffeine 本地缓存 `Cache<Long, Boolean>`，5s TTL，仅存售罄=true | 秒级短路，Redis 压力归零 |
 | 订单号全局唯一 | Hutool Snowflake（无中心化依赖） | 预生成，不依赖 DB 自增 |
 | 重复提交/网络重试 | Redis SET NX EX 300 原子抢占幂等键 + DuplicateKeyException 兜底 | 同一次请求仅创建一个订单 |

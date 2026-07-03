@@ -29,7 +29,7 @@ public class OrderLuaService {
 
     private static final String STOCK_KEY = "ticket:stock:%d";
     private static final String SOLDOUT_KEY = "ticket:soldout:%d";
-    private static final String PURCHASE_KEY = "ticket:purchase:%d";
+    private static final String PURCHASE_KEY = "event:purchase:%d";
     private static final String STREAM_KEY = "stream:orders";
 
     @PostConstruct
@@ -48,23 +48,20 @@ public class OrderLuaService {
     }
 
     /**
-     * 执行购买 Lua 脚本
-     * @param allTicketIds 同一活动下所有票档 ID（用于跨票档检查）
-     * @return [code, msg]: 0=成功, -1=售罄, -2=库存不足, -3=限购超限, -4=跨票档
+     * 执行购买 Lua 脚本（活动级限购：同一 event 下所有票档合计最多 5 张）
+     * @return [code, msg]: 0=成功, -1=售罄, -2=库存不足, -3=活动限购超限
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
     public List<Object> executePurchase(Long ticketId, Long userId, Long eventId,
                                         String orderId, int quantity, int totalStock,
-                                        String totalPrice, long expireTimeMs,
-                                        List<Long> allTicketIds) {
+                                        String totalPrice, long expireTimeMs) {
         List<String> keys = List.of(
                 String.format(STOCK_KEY, ticketId),
                 String.format(SOLDOUT_KEY, ticketId),
-                String.format(PURCHASE_KEY, ticketId),
+                String.format(PURCHASE_KEY, eventId),
                 STREAM_KEY
         );
-        // Args: [0..7] = 核心参数, [8..] = 其他票档 ID（跨票档检查用）
-        String[] baseArgs = {
+        String[] args = {
                 orderId,
                 String.valueOf(userId),
                 String.valueOf(ticketId),
@@ -74,27 +71,22 @@ public class OrderLuaService {
                 totalPrice,
                 String.valueOf(expireTimeMs)
         };
-        String[] allArgs = new String[baseArgs.length + allTicketIds.size()];
-        System.arraycopy(baseArgs, 0, allArgs, 0, baseArgs.length);
-        for (int i = 0; i < allTicketIds.size(); i++) {
-            allArgs[baseArgs.length + i] = String.valueOf(allTicketIds.get(i));
-        }
         return redis.execute(purchaseScript,
                 (RedisSerializer) RedisSerializer.string(),
                 (RedisSerializer) RedisSerializer.string(),
                 keys,
-                (Object[]) allArgs);
+                (Object[]) args);
     }
 
     /**
      * 执行回滚 Lua 脚本（取消/退款/超时）
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    public void executeRollback(Long ticketId, Long userId, int quantity) {
+    public void executeRollback(Long ticketId, Long eventId, Long userId, int quantity) {
         List<String> keys = List.of(
                 String.format(STOCK_KEY, ticketId),
                 String.format(SOLDOUT_KEY, ticketId),
-                String.format(PURCHASE_KEY, ticketId)
+                String.format(PURCHASE_KEY, eventId)
         );
         redis.execute(rollbackScript,
                 (RedisSerializer) RedisSerializer.string(),

@@ -1,7 +1,7 @@
 -- 回滚 Lua：取消/退款/超时关单 → 恢复库存 + 清除售罄标记 + 减少用户购买记录
 -- KEYS[1]: ticket:stock:{ticketId}
 -- KEYS[2]: ticket:soldout:{ticketId}
--- KEYS[3]: ticket:purchase:{ticketId}
+-- KEYS[3]: event:purchase:{eventId}
 -- ARGV[1]: userId
 -- ARGV[2]: quantity
 

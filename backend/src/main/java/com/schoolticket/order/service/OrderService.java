@@ -70,8 +70,8 @@ public class OrderService {
                 log.info("幂等命中: idempotencyKey={}, orderNo={}", req.getIdempotencyKey(), existing);
                 return cached;
             }
-            // 异步落库尚未完成 → 返回 stub 对象，前端可轮询 GET /order/{orderNo}
-            return buildStubOrder(existing, userId, req);
+            // 异步落库尚未完成 → 返回 stub 对象
+            return buildStubOrder(existing, userId, req, null, null);
         }
 
         // 原子抢占幂等键，失败 = 并发冲突
@@ -81,7 +81,7 @@ public class OrderService {
                 Order cached = orderMapper.selectOne(
                         new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, existing));
                 if (cached != null) return cached;
-                return buildStubOrder(existing, userId, req);
+                return buildStubOrder(existing, userId, req, null, null);
             }
             throw new BusinessException(409, "请求处理中，请勿重复提交");
         }
@@ -109,16 +109,10 @@ public class OrderService {
             long expireTimeMs = LocalDateTime.now().plusMinutes(EXPIRE_MINUTES)
                     .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
 
-            // 4. 查该活动所有票档 ID（跨票档检查用）
-            List<Long> allTicketIds = ticketCategoryMapper.selectList(
-                    new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, event.getEventId()))
-                    .stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
-
-            // 5. 执行 Lua 脚本（原子: 扣库存 + 限购 + XADD stream）
+            // 4. 执行 Lua 脚本（原子: 扣库存 + 活动级限购 + XADD stream）
             List<Object> result = orderLuaService.executePurchase(
                     req.getTicketId(), userId, event.getEventId(), orderNo,
-                    req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs,
-                    allTicketIds);
+                    req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs);
 
             long code = result.get(0) instanceof Long ? (Long) result.get(0)
                     : ((Number) result.get(0)).longValue();
@@ -128,17 +122,14 @@ public class OrderService {
                 throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
             }
             if (code == -3) {
-                throw new BusinessException("该票档最多购买5张");
-            }
-            if (code == -4) {
-                throw new BusinessException("该活动您已购买其他票档，每个活动只能购买一类票");
+                throw new BusinessException("该活动累计最多购买5张");
             }
 
             // 6. Lua 成功 → 幂等键指向订单号，返回 stub（落库由 RabbitMQ 消费者异步完成）
             orderLuaService.completeIdempotentKey(req.getIdempotencyKey(), orderNo);
             log.info("订单创建(Stream): orderNo={}, userId={}, ticketId={}, qty={}",
                     orderNo, userId, req.getTicketId(), req.getQuantity());
-            return buildStubOrder(orderNo, userId, req);
+            return buildStubOrder(orderNo, userId, req, totalPrice, ticket);
 
         } catch (BusinessException e) {
             orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
@@ -149,13 +140,21 @@ public class OrderService {
         }
     }
 
-    private Order buildStubOrder(String orderNo, Long userId, OrderCreateReq req) {
+    private Order buildStubOrder(String orderNo, Long userId, OrderCreateReq req,
+                                  BigDecimal totalPrice, TicketCategory ticket) {
+        // 幂等回退路径没有 ticket，自行查库
+        if (ticket == null) {
+            ticket = ticketCategoryMapper.selectById(req.getTicketId());
+        }
+        if (totalPrice == null && ticket != null) {
+            totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
+        }
         Order order = new Order();
         order.setOrderNo(orderNo);
         order.setUserId(userId);
         order.setTicketId(req.getTicketId());
         order.setQuantity(req.getQuantity());
-        order.setTotalPrice(null); // 需查 DB 才有精确值
+        order.setTotalPrice(totalPrice);
         order.setStatus(0);
         order.setExpireTime(LocalDateTime.now().plusMinutes(EXPIRE_MINUTES));
         return order;

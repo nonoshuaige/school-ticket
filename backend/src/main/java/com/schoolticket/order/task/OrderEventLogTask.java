@@ -1,6 +1,8 @@
 package com.schoolticket.order.task;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.schoolticket.event.entity.TicketCategory;
+import com.schoolticket.event.mapper.TicketCategoryMapper;
 import com.schoolticket.order.entity.OrderEventLog;
 import com.schoolticket.order.mapper.OrderEventLogMapper;
 import com.schoolticket.order.service.OrderLuaService;
@@ -29,6 +31,7 @@ public class OrderEventLogTask {
 
     private final OrderEventLogMapper orderEventLogMapper;
     private final OrderLuaService orderLuaService;
+    private final TicketCategoryMapper ticketCategoryMapper;
 
     private static final int MAX_RETRY = 5;
 
@@ -48,8 +51,15 @@ public class OrderEventLogTask {
         log.info("消息表扫描: 发现 {} 条待处理事件", pending.size());
         for (OrderEventLog event : pending) {
             try {
+                TicketCategory ticket = ticketCategoryMapper.selectById(event.getTicketId());
+                if (ticket == null) {
+                    log.error("票档不存在，跳过回滚: ticketId={}, orderNo={}", event.getTicketId(), event.getOrderNo());
+                    event.setStatus(2);
+                    orderEventLogMapper.updateById(event);
+                    continue;
+                }
                 orderLuaService.executeRollback(
-                        event.getTicketId(), event.getUserId(), event.getQuantity());
+                        event.getTicketId(), ticket.getEventId(), event.getUserId(), event.getQuantity());
                 // Redis 回滚成功 → ack
                 event.setStatus(1);
                 orderEventLogMapper.updateById(event);

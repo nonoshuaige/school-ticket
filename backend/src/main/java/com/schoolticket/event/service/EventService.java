@@ -47,6 +47,7 @@ public class EventService {
     private static final String WARMUP_POOL_KEY = "event:pool:warmup";
     private static final String EVENT_VO_PREFIX = "event:vo:";
     private static final String EVENT_TICKETS_PREFIX = "event:tickets:";
+    private static final String EVENT_TICKET_IDS_PREFIX = "event:ticket_ids:";
     private static final String MUTEX_PREFIX = "mutex:event:";
 
     /** 物理 TTL 缓冲：逻辑过期后额外保留 30min，防止 key 被驱逐 */
@@ -294,14 +295,13 @@ public class EventService {
 
     public Map<String, Object> getPurchaseStatus(Long eventId, Long userId) {
         Map<String, Object> result = new HashMap<>();
-        result.put("purchasedTicketId", null);
         result.put("purchasedQuantity", 0);
         result.put("maxQuantity", 5);
 
         if (userId == null) return result;
 
-        List<TicketCategory> allTickets = getTicketsByEvent(eventId);
-        List<Long> ticketIds = allTickets.stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
+        // 优先从 Redis Set 获取 event 下的 ticketId 列表
+        List<Long> ticketIds = getTicketIdsByEvent(eventId);
         if (ticketIds.isEmpty()) return result;
 
         List<Order> existingOrders = orderMapper.selectList(
@@ -311,12 +311,36 @@ public class EventService {
                         .notIn(Order::getStatus, 2, 3));
 
         if (!existingOrders.isEmpty()) {
-            Long purchasedTicketId = existingOrders.get(0).getTicketId();
             int totalQty = existingOrders.stream().mapToInt(Order::getQuantity).sum();
-            result.put("purchasedTicketId", purchasedTicketId);
             result.put("purchasedQuantity", totalQty);
         }
         return result;
+    }
+
+    /**
+     * 获取活动下的所有票档 ID（购票层用，优先 Redis Set）
+     */
+    private List<Long> getTicketIdsByEvent(Long eventId) {
+        String idsKey = EVENT_TICKET_IDS_PREFIX + eventId;
+        Set<String> cached = redis.opsForSet().members(idsKey);
+        if (cached != null && !cached.isEmpty()) {
+            return cached.stream().map(Long::parseLong).collect(Collectors.toList());
+        }
+        // miss → 从 MySQL 回填到 Redis Set
+        List<TicketCategory> tickets = ticketCategoryMapper.selectList(
+                new LambdaQueryWrapper<TicketCategory>()
+                        .eq(TicketCategory::getEventId, eventId));
+        if (!tickets.isEmpty()) {
+            String[] ids = tickets.stream().map(t -> String.valueOf(t.getTicketId())).toArray(String[]::new);
+            redis.opsForSet().add(idsKey, ids);
+            // TTL: 取最晚 saleEndTime
+            Event event = eventMapper.selectById(eventId);
+            long ttl = event != null ? event.getSaleEndTime()
+                    .atZone(ZoneId.of("Asia/Shanghai")).toEpochSecond()
+                    - System.currentTimeMillis() / 1000 + PHYSICAL_TTL_BUFFER_SEC : 3600;
+            redis.expire(idsKey, ttl, TimeUnit.SECONDS);
+        }
+        return tickets.stream().map(TicketCategory::getTicketId).collect(Collectors.toList());
     }
 
     // ===================== Redis 读取 =====================
@@ -599,10 +623,20 @@ public class EventService {
         long physicalTtl = logicalExpireAtSec - System.currentTimeMillis() / 1000 + PHYSICAL_TTL_BUFFER_SEC;
         if (physicalTtl <= 0) physicalTtl = 300;
 
+        // 展示层：活动 VO + 票档详情 JSON
         redis.opsForValue().set(EVENT_VO_PREFIX + event.getEventId(),
                 wrapWithExpireAt(event, logicalExpireAtSec), physicalTtl, TimeUnit.SECONDS);
         redis.opsForValue().set(EVENT_TICKETS_PREFIX + event.getEventId(),
                 wrapWithExpireAt(tickets, logicalExpireAtSec), physicalTtl, TimeUnit.SECONDS);
+
+        // 购票层：event → ticketIds 映射 Set，供购买状态查询快速定位
+        String idsKey = EVENT_TICKET_IDS_PREFIX + event.getEventId();
+        redis.delete(idsKey);
+        String[] ids = tickets.stream().map(t -> String.valueOf(t.getTicketId())).toArray(String[]::new);
+        if (ids.length > 0) {
+            redis.opsForSet().add(idsKey, ids);
+            redis.expire(idsKey, physicalTtl, TimeUnit.SECONDS);
+        }
     }
 
     private void cacheTickets(Long eventId, List<TicketCategory> tickets, long logicalExpireAtSec) {
@@ -610,6 +644,15 @@ public class EventService {
         if (physicalTtl <= 0) physicalTtl = 300;
         redis.opsForValue().set(EVENT_TICKETS_PREFIX + eventId,
                 wrapWithExpireAt(tickets, logicalExpireAtSec), physicalTtl, TimeUnit.SECONDS);
+
+        // 同步更新 ticket_ids Set
+        String idsKey = EVENT_TICKET_IDS_PREFIX + eventId;
+        redis.delete(idsKey);
+        String[] ids = tickets.stream().map(t -> String.valueOf(t.getTicketId())).toArray(String[]::new);
+        if (ids.length > 0) {
+            redis.opsForSet().add(idsKey, ids);
+            redis.expire(idsKey, physicalTtl, TimeUnit.SECONDS);
+        }
     }
 
     // ===================== 互斥锁（SET NX EX） =====================
