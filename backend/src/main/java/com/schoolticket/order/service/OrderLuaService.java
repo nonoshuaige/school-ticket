@@ -31,6 +31,7 @@ public class OrderLuaService {
     private static final String SOLDOUT_KEY = "ticket:soldout:%d";
     private static final String PURCHASE_KEY = "event:purchase:%d";
     private static final String STREAM_KEY = "stream:orders";
+    private static final String ORDER_CACHE_KEY = "order:%s";
 
     @PostConstruct
     public void init() throws Exception {
@@ -109,31 +110,37 @@ public class OrderLuaService {
         });
     }
 
-    // ===================== 幂等键 =====================
+    // ===================== 订单缓存 =====================
 
-    private static final String IDEMPOTENT_PREFIX = "idempotent:order:";
-    private static final int IDEMPOTENT_TTL = 300; // 5 分钟
+    private static final String USER_ORDERS_KEY = "user:orders:%d";
 
-    /** SET NX 原子抢占幂等键，成功返回 true */
-    public boolean tryClaimIdempotentKey(String idempotencyKey) {
-        return Boolean.TRUE.equals(redis.opsForValue()
-                .setIfAbsent(IDEMPOTENT_PREFIX + idempotencyKey, "PENDING",
-                        IDEMPOTENT_TTL, java.util.concurrent.TimeUnit.SECONDS));
+    /** 从 Redis 读取订单 JSON */
+    public String getOrderCache(String orderNo) {
+        return redis.opsForValue().get(String.format(ORDER_CACHE_KEY, orderNo));
     }
 
-    /** 获取幂等键当前值（null=不存在, PENDING=处理中, 其他=订单号） */
-    public String getIdempotentResult(String idempotencyKey) {
-        return redis.opsForValue().get(IDEMPOTENT_PREFIX + idempotencyKey);
+    /** Consumer 落库后 / 状态变更后 更新 Redis 订单缓存 */
+    public void updateOrderCache(String orderNo, String json) {
+        redis.opsForValue().set(String.format(ORDER_CACHE_KEY, orderNo), json, 1800, java.util.concurrent.TimeUnit.SECONDS);
     }
 
-    /** 订单创建成功，将幂等键更新为订单号 */
-    public void completeIdempotentKey(String idempotencyKey, String orderNo) {
-        redis.opsForValue().set(IDEMPOTENT_PREFIX + idempotencyKey, orderNo, IDEMPOTENT_TTL, java.util.concurrent.TimeUnit.SECONDS);
+    /** 下单时 LPUSH 订单号到用户列表，保留最近 10 条 */
+    public void pushUserOrderList(Long userId, String orderNo) {
+        String key = String.format(USER_ORDERS_KEY, userId);
+        redis.opsForList().leftPush(key, orderNo);
+        redis.opsForList().trim(key, 0, 9);
+        redis.expire(key, 1800, java.util.concurrent.TimeUnit.SECONDS);
     }
 
-    /** 业务失败，释放幂等键 */
-    public void releaseIdempotentKey(String idempotencyKey) {
-        redis.delete(IDEMPOTENT_PREFIX + idempotencyKey);
+    /** 读取用户最近订单号列表 */
+    public List<String> getUserOrderList(Long userId) {
+        return redis.opsForList().range(String.format(USER_ORDERS_KEY, userId), 0, -1);
+    }
+
+    /** 批量读取订单缓存 */
+    public List<String> multiGetOrderCache(List<String> orderNos) {
+        List<String> keys = orderNos.stream().map(no -> String.format(ORDER_CACHE_KEY, no)).toList();
+        return redis.opsForValue().multiGet(keys);
     }
 
     /**

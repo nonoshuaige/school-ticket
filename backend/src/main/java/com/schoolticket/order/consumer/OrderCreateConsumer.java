@@ -1,7 +1,9 @@
 package com.schoolticket.order.consumer;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.schoolticket.order.entity.Order;
 import com.schoolticket.order.mapper.OrderMapper;
+import com.schoolticket.order.service.OrderLuaService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
@@ -24,6 +26,8 @@ import java.util.Map;
 public class OrderCreateConsumer {
 
     private final OrderMapper orderMapper;
+    private final OrderLuaService orderLuaService;
+    private final ObjectMapper objectMapper;
 
     @RabbitListener(queues = "#{orderCreateQueue.name}")
     public void handleOrderCreate(Map<String, Object> msg) {
@@ -47,6 +51,11 @@ public class OrderCreateConsumer {
 
             orderMapper.insert(order);
             log.info("订单已落库: orderNo={}, userId={}, ticketId={}", orderNo, userId, ticketId);
+
+            // 刷新 Redis 缓存（stub → 完整数据，含 createTime）
+            try {
+                orderLuaService.updateOrderCache(orderNo, objectMapper.writeValueAsString(order));
+            } catch (Exception ignored) {}
         } catch (DuplicateKeyException e) {
             // 幂等：重复投递（PEL 兜底重试）安全跳过
             log.debug("订单已存在(幂等跳过): orderNo={}", msg.get("orderId"));

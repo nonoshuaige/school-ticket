@@ -11,6 +11,5 @@ public class OrderCreateReq {
     @NotNull(message = "数量不能为空")
     @Min(value = 1, message = "数量至少为1")
     private Integer quantity;
-    @NotNull(message = "幂等键不能为空")
-    private String idempotencyKey;
+
 }

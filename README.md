@@ -11,13 +11,7 @@
 ### 一、秒杀抢购链路 — Lua 原子操作 + Caffeine 售罄短路 + Stream 出箱 + RabbitMQ 可靠落库 + 本地消息表回滚
 
 ```
-用户请求 POST /order/create { ticketId, quantity, idempotencyKey }
-  │
-  ├─ 0. 幂等保护（v3.10）
-  │      ├─ 前端生成 UUID 幂等键
-  │      ├─ Redis SET NX EX 300 抢占 idempotent:order:{key} = "PENDING"
-  │      ├─ 已存在 = orderNo → 查 MySQL 幂等返回
-  │      └─ 已存在 = "PENDING" → 409 "请求处理中"
+用户请求 POST /order/create { ticketId, quantity }（前端按钮 1s 防连点）
   │
   ├─ 1. Caffeine 本地缓存短路（5s TTL）
   │      └─ soldOut=true → 返回"已售罄"
@@ -34,7 +28,9 @@
   │      ├─ HINCRBY event:purchase:{eventId} userId qty
   │      └─ XADD stream:orders (唯一写路径)
   │
-  ├─ 5. Lua 成功 → SET idempotent:order:{key} = orderNo
+  ├─ 5. Lua 成功 → 写 Redis 订单缓存（微秒级间隙）
+  │      ├─ SET order:{orderNo} = JSON stub, EX 1800
+  │      └─ LPUSH user:orders:{userId} orderNo → LTRIM 0 9
   │      返回 stub Order（主线程不再直接 INSERT MySQL）
   │      │
   │      ▼
@@ -46,10 +42,11 @@
   │      ▼
   │  OrderCreateConsumer @RabbitListener
   │      │  INSERT MySQL (唯一落库路径)
+  │      │  刷新 Redis 订单缓存（stub → 完整数据，含 createTime）
   │      │  DuplicateKeyException → 幂等跳过
   │      │  异常 → 抛回 RabbitMQ 重试 / DXL
   │      │
-  │      ▼ 落库完成，前端轮询 GET /order/{orderNo} 获取完整信息
+  │      ▼ 查询 GET /order/{orderNo} 或 /order/list → Redis 优先，不穿透 DB
   
   逆向链路（取消/超时关单 / 退款）:
     cancel / expire
@@ -76,7 +73,7 @@
 | 每人囤票 | `event:purchase:{eventId}` Hash 记录 userId→qty，活动级上限 5 张 | 杜绝脚本囤票 |
 | 售罄后无效请求穿透 Redis | Caffeine 本地缓存 `Cache<Long, Boolean>`，5s TTL，仅存售罄=true | 秒级短路，Redis 压力归零 |
 | 订单号全局唯一 | Hutool Snowflake（无中心化依赖） | 预生成，不依赖 DB 自增 |
-| 重复提交/网络重试 | Redis SET NX EX 300 原子抢占幂等键 + DuplicateKeyException 兜底 | 同一次请求仅创建一个订单 |
+| 重复提交/网络重试 | 前端按钮 1s 防连点 + loading 态 | 同一次请求仅创建一个订单 |
 | Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，RabbitMQ 持久化队列单路径落库（v4.1） | 磁盘级可靠，消息不因 Redis 重启丢失 |
 | 活动缓存击穿 | 逻辑过期 + 互斥锁（SET NX），物理 TTL=逻辑+30min 缓冲，过期返回旧值异步重建（v4.1） | 大量并发不再穿透 DB |
 | 库存恢复 | rollback.lua 原子 INCRBY + DEL soldout + 减少购买记录 | 取消/退款秒级回补 |
@@ -101,7 +98,8 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 | Redis Key | 类型 | 物理TTL | 逻辑过期 | 用途 |
 |-----------|------|---------|---------|------|
-| `idempotent:order:{key}` | String | 300s | — | 幂等键 → "PENDING" 或 orderNo |
+| `order:{orderNo}` | String | 1800s | — | 订单 JSON 缓存（stub → Consumer 落库后刷新为完整数据） |
+| `user:orders:{userId}` | List | 1800s | — | 用户最近 10 条订单号，LPUSH + LTRIM 维护，首页列表 Redis 直达 |
 | `event:pool:hot` | ZSET | max(saleEndTime)+30min | 每5min 重建 | 热卖中活动 ID，score=eventStartTime |
 | `event:pool:warmup` | ZSET | max(saleStartTime)+1d+30min | 每5min 重建 | 预热中活动 ID |
 | `event:vo:{eventId}` | String (JSON) | logicExpire+30min | saleEndTime(热) / saleStartTime(预) | 活动完整信息 + minPrice |
@@ -339,7 +337,7 @@ npm run dev
 | POST | /api/v1/auth/login | 登录（JWT 写入 Cookie + 响应体） |
 | GET | /api/v1/event/list?status=&page=&pageSize= | 活动列表（status=1热卖/0预热，Redis优先，含最低票价） |
 | GET | /api/v1/event/{id} | 活动详情 + 票档 |
-| POST | /api/v1/order/create | **创建订单（幂等键 + Lua 抢购入口）** |
+| POST | /api/v1/order/create | **创建订单（Lua 抢购入口 + Redis 订单缓存）** |
 | POST | /api/v1/order/pay | 模拟支付 |
 | POST | /api/v1/order/cancel | 取消订单（写消息表，异步回滚库存） |
 | POST | /api/v1/order/refund | 申请退款（写退款表，异步消费执行） |

@@ -24,7 +24,10 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import com.fasterxml.jackson.databind.ObjectMapper;
+
 import java.math.BigDecimal;
+import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.ArrayList;
@@ -45,110 +48,72 @@ public class OrderService {
     private final EventMapper eventMapper;
     private final OrderLuaService orderLuaService;
     private final SoldOutCache soldOutCache;
+    private final ObjectMapper objectMapper;
 
     private static final int EXPIRE_MINUTES = 15;
 
     // ===================== 核心履约 =====================
 
     /**
-     * 创建订单（幂等保护 + Redis Lua 原子扣库存 + Stream 写入 + RabbitMQ 异步落库）
+     * 创建订单（Redis Lua 原子扣库存 + Stream 写入 + RabbitMQ 异步落库）
      *
      * 主线程只做 Lua（含 XADD stream），不再直接 INSERT MySQL。
      * StreamToRabbitMQBridge → RabbitMQ → OrderCreateConsumer 是唯⼀落库路径。
+     * 防重提交由前端按钮防连点控制，后端不再做幂等保护。
      */
     public Order createOrder(Long userId, OrderCreateReq req) {
-        // 0. 幂等保护：检查是否已处理过此请求
-        String existing = orderLuaService.getIdempotentResult(req.getIdempotencyKey());
-        if (existing != null) {
-            if ("PENDING".equals(existing)) {
-                throw new BusinessException(409, "请求处理中，请勿重复提交");
-            }
-            // existing = orderNo → 查询 MySQL（可能尚未异步落库）
-            Order cached = orderMapper.selectOne(
-                    new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, existing));
-            if (cached != null) {
-                log.info("幂等命中: idempotencyKey={}, orderNo={}", req.getIdempotencyKey(), existing);
-                return cached;
-            }
-            // 异步落库尚未完成 → 返回 stub 对象
-            return buildStubOrder(existing, userId, req, null, null);
+        // 1. 本地售罄缓存短路
+        if (soldOutCache.isSoldOut(req.getTicketId())) {
+            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
         }
 
-        // 原子抢占幂等键，失败 = 并发冲突
-        if (!orderLuaService.tryClaimIdempotentKey(req.getIdempotencyKey())) {
-            existing = orderLuaService.getIdempotentResult(req.getIdempotencyKey());
-            if (existing != null && !"PENDING".equals(existing)) {
-                Order cached = orderMapper.selectOne(
-                        new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, existing));
-                if (cached != null) return cached;
-                return buildStubOrder(existing, userId, req, null, null);
-            }
-            throw new BusinessException(409, "请求处理中，请勿重复提交");
+        // 2. 查票档信息（无锁 selectById）
+        TicketCategory ticket = ticketCategoryMapper.selectById(req.getTicketId());
+        if (ticket == null) {
+            throw new BusinessException(BusinessException.INVALID_PARAM, "票档不存在");
         }
 
+        Event event = eventMapper.selectById(ticket.getEventId());
+        if (event == null) {
+            throw new BusinessException(BusinessException.INVALID_PARAM, "活动不存在");
+        }
+
+        // 3. 预生成订单号
+        String orderNo = IdUtil.getSnowflakeNextIdStr();
+        BigDecimal totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
+        long expireTimeMs = LocalDateTime.now().plusMinutes(EXPIRE_MINUTES)
+                .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
+
+        // 4. 执行 Lua 脚本（原子: 扣库存 + 活动级限购 + XADD stream）
+        List<Object> result = orderLuaService.executePurchase(
+                req.getTicketId(), userId, event.getEventId(), orderNo,
+                req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs);
+
+        long code = result.get(0) instanceof Long ? (Long) result.get(0)
+                : ((Number) result.get(0)).longValue();
+
+        if (code == -1 || code == -2) {
+            soldOutCache.markSoldOut(req.getTicketId());
+            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+        }
+        if (code == -3) {
+            throw new BusinessException("该活动累计最多购买5张");
+        }
+
+        log.info("订单创建(Stream): orderNo={}, userId={}, ticketId={}, qty={}",
+                orderNo, userId, req.getTicketId(), req.getQuantity());
+
+        // 5. Lua 成功后立即写 Redis：订单缓存 + 用户列表（后续查询不穿透 DB）
+        Order stub = buildStubOrder(orderNo, userId, req, totalPrice, ticket);
         try {
-            // 1. 本地售罄缓存短路
-            if (soldOutCache.isSoldOut(req.getTicketId())) {
-                throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
-            }
-
-            // 2. 查票档信息（无锁 selectById）
-            TicketCategory ticket = ticketCategoryMapper.selectById(req.getTicketId());
-            if (ticket == null) {
-                throw new BusinessException(BusinessException.INVALID_PARAM, "票档不存在");
-            }
-
-            Event event = eventMapper.selectById(ticket.getEventId());
-            if (event == null) {
-                throw new BusinessException(BusinessException.INVALID_PARAM, "活动不存在");
-            }
-
-            // 3. 预生成订单号
-            String orderNo = IdUtil.getSnowflakeNextIdStr();
-            BigDecimal totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
-            long expireTimeMs = LocalDateTime.now().plusMinutes(EXPIRE_MINUTES)
-                    .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
-
-            // 4. 执行 Lua 脚本（原子: 扣库存 + 活动级限购 + XADD stream）
-            List<Object> result = orderLuaService.executePurchase(
-                    req.getTicketId(), userId, event.getEventId(), orderNo,
-                    req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs);
-
-            long code = result.get(0) instanceof Long ? (Long) result.get(0)
-                    : ((Number) result.get(0)).longValue();
-
-            if (code == -1 || code == -2) {
-                soldOutCache.markSoldOut(req.getTicketId());
-                throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
-            }
-            if (code == -3) {
-                throw new BusinessException("该活动累计最多购买5张");
-            }
-
-            // 6. Lua 成功 → 幂等键指向订单号，返回 stub（落库由 RabbitMQ 消费者异步完成）
-            orderLuaService.completeIdempotentKey(req.getIdempotencyKey(), orderNo);
-            log.info("订单创建(Stream): orderNo={}, userId={}, ticketId={}, qty={}",
-                    orderNo, userId, req.getTicketId(), req.getQuantity());
-            return buildStubOrder(orderNo, userId, req, totalPrice, ticket);
-
-        } catch (BusinessException e) {
-            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
-            throw e;
-        } catch (Exception e) {
-            orderLuaService.releaseIdempotentKey(req.getIdempotencyKey());
-            throw e;
-        }
+            orderLuaService.updateOrderCache(orderNo, objectMapper.writeValueAsString(stub));
+            orderLuaService.pushUserOrderList(userId, orderNo);
+        } catch (Exception ignored) {}
+        return stub;
     }
 
     private Order buildStubOrder(String orderNo, Long userId, OrderCreateReq req,
                                   BigDecimal totalPrice, TicketCategory ticket) {
-        // 幂等回退路径没有 ticket，自行查库
-        if (ticket == null) {
-            ticket = ticketCategoryMapper.selectById(req.getTicketId());
-        }
-        if (totalPrice == null && ticket != null) {
-            totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
-        }
         Order order = new Order();
         order.setOrderNo(orderNo);
         order.setUserId(userId);
@@ -173,6 +138,7 @@ public class OrderService {
         order.setStatus(1);
         order.setPaidTime(LocalDateTime.now());
         orderMapper.updateById(order);
+        refreshOrderCache(orderNo, order);
         log.info("订单支付: orderNo={}", orderNo);
         return order;
     }
@@ -193,6 +159,7 @@ public class OrderService {
         writeEventLog(order, 1);
 
         soldOutCache.invalidate(order.getTicketId());
+        refreshOrderCache(orderNo, order);
         log.info("订单取消: orderNo={}", orderNo);
         return order;
     }
@@ -229,6 +196,7 @@ public class OrderService {
         order.setStatus(4);
         order.setUseTime(LocalDateTime.now());
         orderMapper.updateById(order);
+        refreshOrderCache(orderNo, order);
         log.info("订单核销: orderNo={}", orderNo);
         return order;
     }
@@ -247,6 +215,7 @@ public class OrderService {
 
         writeEventLog(order, 2);
         soldOutCache.invalidate(order.getTicketId());
+        refreshOrderCache(orderNo, order);
 
         log.info("退款执行完成: orderNo={}", orderNo);
     }
@@ -254,6 +223,14 @@ public class OrderService {
     // ===================== 查询 =====================
 
     public IPage<EventOrderGroupVO> listOrders(Long userId, Integer pageNum, Integer pageSize, Integer status) {
+        // Redis 路径：无状态筛选 + 首页（缓存最多 10 条）
+        if (status == null && pageNum == 1) {
+            List<Order> orders = loadOrdersFromCache(userId);
+            if (!orders.isEmpty()) {
+                return groupAndPage(orders, pageNum, pageSize);
+            }
+        }
+        // DB 路径：状态筛选 / 翻页 / 缓存 miss
         LambdaQueryWrapper<Order> wrapper = new LambdaQueryWrapper<Order>()
                 .eq(Order::getUserId, userId);
         if (status != null) {
@@ -261,7 +238,25 @@ public class OrderService {
         }
         wrapper.orderByDesc(Order::getCreateTime);
         List<Order> allOrders = orderMapper.selectList(wrapper);
+        return groupAndPage(allOrders, pageNum, pageSize);
+    }
 
+    private List<Order> loadOrdersFromCache(Long userId) {
+        List<String> orderNos = orderLuaService.getUserOrderList(userId);
+        if (orderNos == null || orderNos.isEmpty()) return List.of();
+        List<Order> orders = new ArrayList<>();
+        for (String no : orderNos) {
+            String json = orderLuaService.getOrderCache(no);
+            if (json != null) {
+                try {
+                    orders.add(objectMapper.readValue(json, Order.class));
+                } catch (Exception ignored) {}
+            }
+        }
+        return orders;
+    }
+
+    private IPage<EventOrderGroupVO> groupAndPage(List<Order> allOrders, int pageNum, int pageSize) {
         Map<Long, EventOrderGroupVO> groupMap = new LinkedHashMap<>();
         for (Order order : allOrders) {
             OrderVO vo = convertToVO(order);
@@ -289,11 +284,32 @@ public class OrderService {
     }
 
     public OrderVO getOrderDetail(String orderNo) {
+        // 1. Redis 优先（Lua 原子写入，无窗口期）
+        String cached = orderLuaService.getOrderCache(orderNo);
+        if (cached != null) {
+            try {
+                Order order = objectMapper.readValue(cached, Order.class);
+                return convertToVO(order);
+            } catch (Exception e) {
+                log.warn("订单缓存反序列化失败, 回源MySQL: orderNo={}", orderNo, e);
+            }
+        }
+        // 2. Redis miss → MySQL 兜底
         Order order = getOrder(orderNo);
+        // 回填缓存
+        try {
+            orderLuaService.updateOrderCache(orderNo, objectMapper.writeValueAsString(order));
+        } catch (Exception ignored) {}
         return convertToVO(order);
     }
 
     // ===================== 内部方法 =====================
+
+    private void refreshOrderCache(String orderNo, Order order) {
+        try {
+            orderLuaService.updateOrderCache(orderNo, objectMapper.writeValueAsString(order));
+        } catch (Exception ignored) {}
+    }
 
     private Order getOrder(String orderNo) {
         Order order = orderMapper.selectOne(
@@ -382,6 +398,7 @@ public class OrderService {
 
         writeEventLog(order, 3);
         soldOutCache.invalidate(order.getTicketId());
+        refreshOrderCache(order.getOrderNo(), order);
 
         log.info("超时关单: orderNo={}", order.getOrderNo());
     }

@@ -29,9 +29,8 @@
 </template>
 
 <script setup>
-import { ref, computed, onMounted } from 'vue'
+import { ref, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { showToast } from 'vant'
 import { storeToRefs } from 'pinia'
 import { useOrderStore } from '../stores/order'
 import { createOrder } from '../api/order'
@@ -42,12 +41,6 @@ const orderStore = useOrderStore()
 
 const { currentEvent: event, selectedTicket: ticket, quantity: qty } = storeToRefs(orderStore)
 const paying = ref(false)
-const idempotencyKey = ref('')
-
-// 页面挂载时生成幂等键，整个下单流程不变
-onMounted(() => {
-  idempotencyKey.value = crypto.randomUUID()
-})
 
 const total = computed(() => {
   if (!ticket.value) return '0.00'
@@ -63,21 +56,23 @@ function handleBack() {
   router.back()
 }
 
+let lastSubmitTime = 0
+
 async function handleSubmit() {
-  if (!idempotencyKey.value) {
-    idempotencyKey.value = crypto.randomUUID()
-  }
+  const now = Date.now()
+  if (now - lastSubmitTime < 1000) return
+  lastSubmitTime = now
+
   paying.value = true
   try {
     const order = await createOrder({
       ticketId: ticket.value.ticketId,
-      quantity: qty.value,
-      idempotencyKey: idempotencyKey.value
+      quantity: qty.value
     })
     orderStore.setCurrentOrder(order)
     router.push('/order/pay')
   } catch {
-    // 请求失败(超时/网络错误)保留幂等键，用户可重试同一键
+    // ignore
   } finally {
     paying.value = false
   }
