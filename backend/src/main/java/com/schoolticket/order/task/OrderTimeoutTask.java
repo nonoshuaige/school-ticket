@@ -14,8 +14,8 @@ import java.time.LocalDateTime;
 import java.util.List;
 
 /**
- * 订单超时关单定时任务
- * 每 30 秒扫描一次，将超时未支付的订单自动取消并回补名额
+ * 订单超时关单兜底任务。
+ * 主路径由 RabbitMQ order.delay.queue TTL 到期后触发；这里仅扫描明显滞后的超时订单。
  */
 @Slf4j
 @Component
@@ -26,12 +26,12 @@ public class OrderTimeoutTask {
     private final OrderService orderService;
     private final TransactionTemplate transactionTemplate;
 
-    @Scheduled(fixedRate = 30000)
+    @Scheduled(fixedRate = 300000)
     public void cancelExpiredOrders() {
         List<Order> expiredOrders = orderMapper.selectList(
                 new LambdaQueryWrapper<Order>()
                         .eq(Order::getStatus, 0)
-                        .lt(Order::getExpireTime, LocalDateTime.now()));
+                        .lt(Order::getExpireTime, LocalDateTime.now().minusMinutes(1)));
 
         if (expiredOrders.isEmpty()) {
             return;

@@ -29,7 +29,7 @@ public class OrderCreateConsumer {
     private final OrderLuaService orderLuaService;
     private final ObjectMapper objectMapper;
 
-    @RabbitListener(queues = "#{orderCreateQueue.name}")
+    @RabbitListener(queues = "#{orderCreateQueue.name}", containerFactory = "orderRabbitListenerContainerFactory")
     public void handleOrderCreate(Map<String, Object> msg) {
         try {
             String orderNo   = (String) msg.get("orderId");

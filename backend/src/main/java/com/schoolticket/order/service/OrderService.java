@@ -2,6 +2,7 @@ package com.schoolticket.order.service;
 
 import cn.hutool.core.util.IdUtil;
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.baomidou.mybatisplus.core.metadata.IPage;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.schoolticket.common.BusinessException;
@@ -165,12 +166,24 @@ public class OrderService {
     public Order payOrder(String orderNo) {
         Order order = getOrder(orderNo);
         validateStatus(order, 0, "订单不是待支付状态");
-        if (LocalDateTime.now().isAfter(order.getExpireTime())) {
+        LocalDateTime now = LocalDateTime.now();
+        if (now.isAfter(order.getExpireTime())) {
             throw new BusinessException(BusinessException.ORDER_EXPIRED, "订单已过期");
         }
+        Order update = new Order();
+        update.setStatus(1);
+        update.setPaidTime(now);
+        int updated = orderMapper.update(update,
+                new LambdaUpdateWrapper<Order>()
+                        .eq(Order::getOrderNo, orderNo)
+                        .eq(Order::getStatus, 0)
+                        .ge(Order::getExpireTime, now));
+        if (updated == 0) {
+            throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, "订单状态已变化，请刷新后重试");
+        }
+
         order.setStatus(1);
-        order.setPaidTime(LocalDateTime.now());
-        orderMapper.updateById(order);
+        order.setPaidTime(now);
         refreshOrderCache(orderNo, order);
         log.info("订单支付: orderNo={}", orderNo);
         return order;
@@ -183,10 +196,21 @@ public class OrderService {
     public Order cancelOrder(String orderNo) {
         Order order = getOrder(orderNo);
         validateStatus(order, 0, "只有待支付订单可取消");
-        replenishTicket(order);
+        LocalDateTime now = LocalDateTime.now();
+        Order update = new Order();
+        update.setStatus(2);
+        update.setCancelTime(now);
+        int updated = orderMapper.update(update,
+                new LambdaUpdateWrapper<Order>()
+                        .eq(Order::getOrderNo, orderNo)
+                        .eq(Order::getStatus, 0));
+        if (updated == 0) {
+            throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, "订单状态已变化，请刷新后重试");
+        }
+
         order.setStatus(2);
-        order.setCancelTime(LocalDateTime.now());
-        orderMapper.updateById(order);
+        order.setCancelTime(now);
+        replenishTicket(order);
 
         // 写本地消息表，由定时任务异步驱动 Redis Lua 回滚，保证逆向链路可靠
         writeEventLog(order, 1);
@@ -203,6 +227,18 @@ public class OrderService {
     public Order refundOrder(String orderNo) {
         Order order = getOrder(orderNo);
         validateStatus(order, 1, "只有已支付订单可退款");
+        LocalDateTime now = LocalDateTime.now();
+
+        Order update = new Order();
+        update.setStatus(3);
+        update.setRefundTime(now);
+        int updated = orderMapper.update(update,
+                new LambdaUpdateWrapper<Order>()
+                        .eq(Order::getOrderNo, orderNo)
+                        .eq(Order::getStatus, 1));
+        if (updated == 0) {
+            throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, "订单状态已变化，请刷新后重试");
+        }
 
         Refund refund = new Refund();
         refund.setRefundId(orderNo);
@@ -214,6 +250,9 @@ public class OrderService {
         refund.setStatus(0);
         refundMapper.insert(refund);
 
+        order.setStatus(3);
+        order.setRefundTime(now);
+        refreshOrderCache(orderNo, order);
         log.info("退款申请已入表: orderNo={}", orderNo);
         return order;
     }
@@ -225,9 +264,20 @@ public class OrderService {
     public Order useOrder(String orderNo) {
         Order order = getOrder(orderNo);
         validateStatus(order, 1, "只有已支付订单可核销");
+        LocalDateTime now = LocalDateTime.now();
+        Order update = new Order();
+        update.setStatus(4);
+        update.setUseTime(now);
+        int updated = orderMapper.update(update,
+                new LambdaUpdateWrapper<Order>()
+                        .eq(Order::getOrderNo, orderNo)
+                        .eq(Order::getStatus, 1));
+        if (updated == 0) {
+            throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, "订单状态已变化，请刷新后重试");
+        }
+
         order.setStatus(4);
-        order.setUseTime(LocalDateTime.now());
-        orderMapper.updateById(order);
+        order.setUseTime(now);
         refreshOrderCache(orderNo, order);
         log.info("订单核销: orderNo={}", orderNo);
         return order;
@@ -240,10 +290,25 @@ public class OrderService {
     @Transactional
     public void processRefund(String orderNo) {
         Order order = getOrder(orderNo);
+        if (order.getStatus() == 1) {
+            LocalDateTime now = LocalDateTime.now();
+            Order update = new Order();
+            update.setStatus(3);
+            update.setRefundTime(now);
+            int updated = orderMapper.update(update,
+                    new LambdaUpdateWrapper<Order>()
+                            .eq(Order::getOrderNo, orderNo)
+                            .eq(Order::getStatus, 1));
+            if (updated == 0) {
+                throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, "订单状态已变化，请刷新后重试");
+            }
+            order.setStatus(3);
+            order.setRefundTime(now);
+        } else if (order.getStatus() != 3) {
+            throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, "订单状态已变化，无法退款");
+        }
+
         replenishTicket(order);
-        order.setStatus(3);
-        order.setRefundTime(LocalDateTime.now());
-        orderMapper.updateById(order);
 
         writeEventLog(order, 2);
         refreshOrderCache(orderNo, order);
@@ -417,19 +482,57 @@ public class OrderService {
     // ===================== 定时任务用 =====================
 
     /**
-     * 超时关单 —— 由 OrderTimeoutTask 调用
-     * DB 回滚 + 写本地消息表驱动 Redis 回滚
+     * RabbitMQ 延时队列触发的超时关单入口。
+     * 重复延时消息、PEL 重投或兜底扫描并发到达时，只允许待支付且已过期订单进入取消流程。
      */
     @Transactional
-    public void expireOrder(Order order) {
-        replenishTicket(order);
+    public boolean closeExpiredOrder(String orderNo) {
+        Order order = orderMapper.selectOne(
+                new LambdaQueryWrapper<Order>().eq(Order::getOrderNo, orderNo));
+        if (order == null) {
+            log.warn("延时关单跳过: 订单不存在 orderNo={}", orderNo);
+            return false;
+        }
+        if (order.getStatus() != 0) {
+            log.info("延时关单跳过: 订单非待支付 orderNo={}, status={}", orderNo, order.getStatus());
+            return false;
+        }
+        if (LocalDateTime.now().isBefore(order.getExpireTime())) {
+            log.info("延时关单跳过: 订单尚未过期 orderNo={}, expireTime={}", orderNo, order.getExpireTime());
+            return false;
+        }
+        return expireOrder(order);
+    }
+
+    /**
+     * 超时关单 —— RabbitMQ 延时队列主路径，OrderTimeoutTask 仅作为兜底扫描。
+     * DB 回滚 + 写本地消息表驱动 Redis 回滚。
+     */
+    @Transactional
+    public boolean expireOrder(Order order) {
+        LocalDateTime now = LocalDateTime.now();
+        Order update = new Order();
+        update.setStatus(2);
+        update.setCancelTime(now);
+
+        int updated = orderMapper.update(update,
+                new LambdaUpdateWrapper<Order>()
+                        .eq(Order::getOrderNo, order.getOrderNo())
+                        .eq(Order::getStatus, 0)
+                        .le(Order::getExpireTime, now));
+        if (updated == 0) {
+            log.info("超时关单跳过: 状态已变化或未过期 orderNo={}", order.getOrderNo());
+            return false;
+        }
+
         order.setStatus(2);
-        order.setCancelTime(LocalDateTime.now());
-        orderMapper.updateById(order);
+        order.setCancelTime(now);
+        replenishTicket(order);
 
         writeEventLog(order, 3);
         refreshOrderCache(order.getOrderNo(), order);
 
         log.info("超时关单: orderNo={}", order.getOrderNo());
+        return true;
     }
 }

@@ -2,6 +2,7 @@ package com.schoolticket.order.cache;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
+import com.schoolticket.common.BusinessException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -9,13 +10,14 @@ import org.springframework.stereotype.Component;
 
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * 本地售罄缓存：Caffeine 5秒过期 + 单飞锁防击穿。
  * 只存 soldOut=true 的 ticketId，未命中 = 未售罄。
  *
- * 单飞锁：Caffeine 未命中时，同一 ticketId 只有一个线程查询 Redis，
- * 其余线程等待结果，避免高并发下大量请求击穿到 Redis。
+ * 单飞锁：tryLock 抢锁，抢到的查 Redis 并写入 Caffeine，
+ * 没抢到的直接快速失败，避免热点窗口大量请求占住业务线程。
  */
 @Slf4j
 @Component
@@ -29,8 +31,7 @@ public class SoldOutCache {
             .maximumSize(1000)
             .build();
 
-    /** per-ticket 锁对象池，用于单飞锁 */
-    private final ConcurrentHashMap<Long, Object> locks = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, ReentrantLock> locks = new ConcurrentHashMap<>();
 
     private static final String SOLDOUT_KEY = "ticket:soldout:%d";
 
@@ -42,13 +43,6 @@ public class SoldOutCache {
         cache.put(ticketId, Boolean.TRUE);
     }
 
-    /**
-     * 单飞锁检查售罄状态。
-     * Caffeine 命中 → 直接返回；未命中 → per-key 锁 → 查询 Redis → 更新 Caffeine。
-     *
-     * @param ticketId 票档ID
-     * @return true=已售罄, false=有库存
-     */
     public boolean checkSoldOut(Long ticketId) {
         // 快速路径：Caffeine 命中
         Boolean cached = cache.getIfPresent(ticketId);
@@ -56,10 +50,11 @@ public class SoldOutCache {
             return true;
         }
 
-        Object lock = locks.computeIfAbsent(ticketId, k -> new Object());
-        synchronized (lock) {
+        ReentrantLock lock = locks.computeIfAbsent(ticketId, k -> new ReentrantLock());
+
+        if (lock.tryLock()) {
             try {
-                // 双重检查：可能前一个线程已更新了 Caffeine
+                // 拿到锁后双重检查：可能 Caffeine 已被写入（极少情况）
                 cached = cache.getIfPresent(ticketId);
                 if (Boolean.TRUE.equals(cached)) {
                     return true;
@@ -76,8 +71,12 @@ public class SoldOutCache {
                 log.error("单飞锁查Redis售罄异常 ticketId={}", ticketId, e);
                 return false;
             } finally {
+                lock.unlock();
                 locks.remove(ticketId, lock);
             }
+        } else {
+            // 没抢到锁说明同票档已有线程在回查 Redis。直接快速失败，保护后续 Lua/队列链路。
+            throw new BusinessException("请求过于火爆，请稍后重试");
         }
     }
 }

@@ -17,7 +17,7 @@
   │
   ├─ 1. Caffeine 本地售罄短路 + 单飞锁（5s TTL）
   │      ├─ 命中 → 返回"已售罄"
-  │      └─ 未命中 → per-key 锁 → 单线程查 Redis soldout 标记 → 更新 Caffeine
+  │      └─ 未命中 → tryLock 单线程查 Redis soldout 标记；锁竞争失败 → 快速返回"请求火爆"
   │
   ├─ 2. Redis 售罄预检（Java 侧 GET soldout，比 Lua 更快失败）
   │
@@ -40,11 +40,19 @@
   ├─ 7. 返回 stub Order（status=-1，前端展示"排队中"蓝色状态）
   │      │
   │      ▼
-  │  StreamToRabbitMQBridge (阻塞队列, v4.4)
+  │  StreamToRabbitMQBridge (阻塞队列, v4.6)
   │      │  Reader 线程 XREAD BLOCK → LinkedBlockingQueue
-  │      │  Worker×4 take() → publish RabbitMQ → XACK
+  │      │  Worker×4 take() → 同时投递 order.create / order.delay → XACK
   │      │
   │      │  PEL 兜底 (每 5s): XPENDING → 卡住 >5s → 重投 RabbitMQ → XACK
+  │      │
+  │      ├─ order.create.queue → OrderCreateConsumer 唯一落库
+  │      └─ order.delay.queue(TTL=15min) → order.close.queue 超时关单
+  │
+  │      ▼
+  │  OrderCloseConsumer @RabbitListener
+  │      │  CAS 条件更新：status=0 && expire_time<=now 才能关单
+  │      │  写 order_event_log 驱动 Redis 回滚，重复消息幂等跳过
   │      │
   │      ▼
   │  OrderCreateConsumer @RabbitListener
@@ -58,7 +66,7 @@
   逆向链路（取消/超时关单 / 退款）:
     cancel / expire
       │
-      ├─ MySQL 事务内: UPDATE order status + 回补 remaining
+      ├─ MySQL 事务内: CAS UPDATE order status + 回补 remaining
       │         └─ INSERT order_event_log (status=0)
       │              → OrderEventLogTask 每 10s → rollback.lua → ack
       └─ Caffeine 不主动 invalidate，5s TTL 自然过期
@@ -84,8 +92,9 @@
 | Java 侧预检快速失败 | 售罄→库存→限购 三层 Redis 读（概率递减），无效请求不进 Lua（v4.5） | 减少无效 Lua 调用 |
 | Lua 脚本原子性 | 安全校验 + DECRBY + HINCRBY + SET 订单缓存 + XADD stream 全部在 Lua 内完成（v4.5） | 订单写入无间隙，状态一致 |
 | 订单排队状态 | Lua 写 status=-1（排队中）→ Consumer 落库刷 status=0（待支付）→ 前端区分展示（v4.5） | 查询全程走 Redis，零 DB 穿透 |
-| Caffeine 击穿 | 单飞锁：per-ticketId synchronized 双重检查，未命中时仅一个线程查 Redis | 同类票档同一时刻仅一次 Redis 查询 |
-| Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，RabbitMQ 持久化队列单路径落库（v4.1） | 磁盘级可靠，消息不因 Redis 重启丢失 |
+| Caffeine 击穿 | 单飞锁：per-ticketId tryLock，抢到锁才回查 Redis，锁竞争失败快速返回（v4.6） | 同类票档同一时刻仅一次 Redis 查询，不放大线程等待 |
+| Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，同时投递成单队列与延时关单队列（v4.6） | 磁盘级可靠，消息不因 Redis 重启丢失 |
+| 支付/关单状态冲突 | 状态机 + CAS 条件更新（status 前置条件 + expire_time 条件） | 支付、取消、超时、退款、核销并发时仅一个流转成功 |
 | 活动缓存击穿 | 逻辑过期 + 互斥锁（SET NX），物理 TTL=逻辑+30min 缓冲，过期返回旧值异步重建（v4.1） | 大量并发不再穿透 DB |
 | Pool 重建空窗期 | 临时 ZSET 构建 + RENAME 原子替换，避免先删后建（v4.5） | 重建期间查询不返回空列表 |
 | 库存恢复 | rollback.lua 原子 INCRBY + DEL soldout + 减少购买记录 | 取消/退款秒级回补 |
@@ -93,7 +102,7 @@
 | 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask 消费执行 → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，削峰填谷 |
 | Caffeine 失效时机 | 不主动 invalidate，依赖 5s TTL 自然过期 + OrderEventLogTask 清除 Redis soldout 标记后缓存冷却 | 避免假售罄循环 |
 
-**Caffeine 本地售罄缓存（v4.4 单飞锁）：**
+**Caffeine 本地售罄缓存（v4.6 单飞锁快速失败）：**
 
 ```java
 Cache<Long, Boolean> cache = Caffeine.newBuilder()
@@ -101,7 +110,8 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
     .maximumSize(1000)
     .build();
 // 仅缓存 soldOut=true，未命中 = 未售罄
-// checkSoldOut(): Caffeine 命中 → 直接返回；未命中 → per-key synchronized 单线程查 Redis
+// checkSoldOut(): Caffeine 命中 → 直接返回；未命中 → tryLock 单线程查 Redis
+// tryLock 失败 → 直接快速返回"请求过于火爆"，不自旋等待、不进入 Lua
 // 取消/退款不再主动 invalidate，依赖 TTL 自然过期
 // 假售罄修复：Redis soldout 标记由 OrderEventLogTask 清除，缓存过期后下次查询正确状态
 ```
@@ -268,7 +278,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | 数据库 | MySQL 8.0 | 11 张表，100 用户 / 15 活动 / 200 笔记 / 10 种草关联 |
 | 缓存 | Redis 7.4 (Alpine) | ZSET 游标分页 + Lua 脚本 + Stream + Bitmap 布隆 |
 | 本地缓存 | Caffeine | 售罄标记，5s TTL |
-| 消息队列 | RabbitMQ 3.13 (Alpine) | 5 个 Queue（4 个笔记+关注 + 1 个订单创建），异步兜底 + 可靠落库 |
+| 消息队列 | RabbitMQ 3.13 (Alpine) | 8 个 Queue（笔记/关注 + 订单创建/延时关单/死信），异步兜底 + 可靠落库 |
 | 容器 | Docker Desktop | Redis + RabbitMQ |
 
 ---
@@ -386,6 +396,7 @@ npm run dev
 │           │   ├── service/OrderLuaService.java    # Lua 执行 + 库存预热
 │           │   ├── consumer/StreamToRabbitMQBridge.java # Stream→RabbitMQ 桥接 + PEL 兜底
 │           │   ├── consumer/OrderCreateConsumer.java    # RabbitMQ 消费者，唯一落库路径
+│           │   ├── consumer/OrderCloseConsumer.java     # RabbitMQ 延时关单消费者
 │           │   ├── cache/SoldOutCache.java         # Caffeine 售罄缓存 + 单飞锁
 │           │   ├── cache/RateLimiter.java          # 用户级请求限流（每人 1s/次）
 │           │   ├── task/OrderTimeoutTask.java      # 超时关单扫描

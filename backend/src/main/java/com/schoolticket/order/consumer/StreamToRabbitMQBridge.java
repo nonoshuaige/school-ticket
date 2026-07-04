@@ -19,8 +19,8 @@ import java.util.concurrent.LinkedBlockingQueue;
 /**
  * Stream → RabbitMQ 桥接 + PEL 兜底
  *
- * 主路径: Reader 线程 XREAD BLOCK → LinkedBlockingQueue → Worker 线程 publish RabbitMQ → XACK
- * 兜底:   XPENDING 扫描 → XCLAIM 卡住消息 → publish RabbitMQ → XACK (每 5s)
+ * 主路径: Reader 线程 XREAD BLOCK → LinkedBlockingQueue → Worker 线程 publish RabbitMQ 双队列 → XACK
+ * 兜底:   XPENDING 扫描 → XCLAIM 卡住消息 → publish RabbitMQ 双队列 → XACK (每 5s)
  *
  * 设计: Lua 只能原子写 Stream, 不能调 RabbitMQ。
  *       本桥接将消息从 Redis 内存级可靠升级为 RabbitMQ 磁盘级可靠。
@@ -57,7 +57,7 @@ public class StreamToRabbitMQBridge {
         reader.setDaemon(true);
         reader.start();
 
-        // Worker 线程：从队列取出 → 发布 RabbitMQ → ACK
+        // Worker 线程：从队列取出 → 发布 RabbitMQ 创建/延时双队列 → ACK
         for (int i = 0; i < WORKER_COUNT; i++) {
             Thread worker = new Thread(this::consumeLoop, "stream-worker-" + i);
             worker.setDaemon(true);
@@ -94,20 +94,22 @@ public class StreamToRabbitMQBridge {
                 Thread.currentThread().interrupt();
                 break;
             } catch (Exception e) {
+                if (!running || isStopping(e)) {
+                    break;
+                }
                 log.error("Stream reader 异常", e);
             }
         }
     }
 
-    /** Worker: 从队列取出 → RabbitMQ → ACK */
+    /** Worker: 从队列取出 → RabbitMQ 创建/延时双投递 → ACK */
     private void consumeLoop() {
         while (running) {
             try {
                 MapRecord<String, Object, Object> record = queue.take();
                 try {
                     Map<String, Object> msg = toMessageMap(record.getValue());
-                    rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
-                            RabbitMQConfig.RK_ORDER_CREATE, msg);
+                    publishOrderMessages(msg);
                     redis.opsForStream().acknowledge(STREAM_KEY, GROUP, record.getId());
                 } catch (Exception e) {
                     log.error("Bridge publish failed, will retry via PEL: entryId={}", record.getId(), e);
@@ -122,7 +124,7 @@ public class StreamToRabbitMQBridge {
         }
     }
 
-    /** 兜底: 扫描 PEL 中卡住 > 5s 的消息 → XRANGE → RabbitMQ → ACK */
+    /** 兜底: 扫描 PEL 中卡住 > 5s 的消息 → XRANGE → RabbitMQ 创建/延时双投递 → ACK */
     @Scheduled(fixedDelay = 5000)
     public void bridgePending() {
         try {
@@ -146,8 +148,7 @@ public class StreamToRabbitMQBridge {
 
                     if (records != null && !records.isEmpty()) {
                         Map<String, Object> msg = toMessageMap(records.get(0).getValue());
-                        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
-                                RabbitMQConfig.RK_ORDER_CREATE, msg);
+                        publishOrderMessages(msg);
                     }
                     redis.opsForStream().acknowledge(STREAM_KEY, GROUP, entryId);
                     log.info("PEL 兜底投递成功: entryId={}", entryId);
@@ -158,6 +159,19 @@ public class StreamToRabbitMQBridge {
         } catch (Exception e) {
             log.error("bridgePending error", e);
         }
+    }
+
+    private void publishOrderMessages(Map<String, Object> msg) {
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
+                RabbitMQConfig.RK_ORDER_CREATE, msg);
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
+                RabbitMQConfig.RK_ORDER_DELAY, msg);
+    }
+
+    private boolean isStopping(Exception e) {
+        return e instanceof IllegalStateException
+                && e.getMessage() != null
+                && e.getMessage().contains("STOPPING");
     }
 
     private Map<String, Object> toMessageMap(Map<Object, Object> fields) {
