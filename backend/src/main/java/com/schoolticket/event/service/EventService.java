@@ -530,12 +530,14 @@ public class EventService {
     // ===================== Pool 重建 =====================
 
     /**
-     * 全量重建单个 pool：查 DB → 逐条缓存 VO+tickets → 重建 ZSET → 设过期
+     * 全量重建单个 pool：查 DB → 写入临时 ZSET → RENAME 原子替换 → 设过期。
+     * 避免先删后建造成的空窗期（查询侧看到空 pool 返回空列表）。
      */
     private void rebuildPool(int status) {
         LocalDateTime now = LocalDateTime.now();
         List<Event> events;
         String poolKey = toPoolKey(status);
+        String tmpKey = poolKey + ":tmp";
 
         if (status == 1) {
             events = eventMapper.selectList(new LambdaQueryWrapper<Event>()
@@ -547,9 +549,6 @@ public class EventService {
                     .gt(Event::getSaleStartTime, now)
                     .orderByAsc(Event::getEventStartTime));
         }
-
-        // 清空旧 pool
-        redis.delete(poolKey);
 
         long maxLogicalExpireAt = 0;
         for (Event event : events) {
@@ -564,7 +563,15 @@ public class EventService {
 
             long score = event.getEventStartTime()
                     .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
-            redis.opsForZSet().add(poolKey, String.valueOf(event.getEventId()), score);
+            redis.opsForZSet().add(tmpKey, String.valueOf(event.getEventId()), score);
+        }
+
+        // RENAME 原子覆盖旧 poolKey，无空窗期（Redis 单命令保证原子性）
+        if (!events.isEmpty()) {
+            redis.rename(tmpKey, poolKey);
+        } else {
+            redis.delete(tmpKey);
+            redis.delete(poolKey);
         }
 
         // 物理 TTL
@@ -583,7 +590,6 @@ public class EventService {
                         .atZone(ZoneId.of("Asia/Shanghai")).toEpochSecond();
                 for (TicketCategory ticket : ticketCategoryMapper.selectList(
                         new LambdaQueryWrapper<TicketCategory>().eq(TicketCategory::getEventId, event.getEventId()))) {
-                    // 仅在库存 key 不存在时写入，避免覆盖 Lua 实时库存
                     if (Boolean.FALSE.equals(redis.hasKey("ticket:stock:" + ticket.getTicketId()))) {
                         orderLuaService.setStock(ticket.getTicketId(), ticket.getRemainingQuantity(), stockExpireSec);
                     }

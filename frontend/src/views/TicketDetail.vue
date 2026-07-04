@@ -28,6 +28,7 @@
 
     <!-- 操作按钮 -->
     <div style="margin: 30px 16px;">
+      <van-button v-if="order.status === -1" round block loading disabled>订单处理中，请稍候...</van-button>
       <van-button v-if="order.status === 0" round block type="primary" @click="handlePay" style="margin-bottom:10px">去支付</van-button>
       <van-button v-if="order.status === 0" round block @click="handleCancel">取消订单</van-button>
       <van-button v-if="order.status === 1" round block @click="handleRefund">申请退款</van-button>
@@ -48,12 +49,12 @@ const orderStore = useOrderStore()
 const order = ref(null)
 
 const statusBg = computed(() => {
-  const map = { 0: '#f57c00', 1: '#4caf50', 2: '#999', 3: '#f44336', 4: '#2196f3' }
+  const map = { '-1': '#2196f3', 0: '#f57c00', 1: '#4caf50', 2: '#999', 3: '#f44336', 4: '#2196f3' }
   return map[order.value?.status] || '#999'
 })
 
 const statusIcon = computed(() => {
-  const map = { 0: 'clock-o', 1: 'paid', 2: 'info-o', 3: 'refund-o', 4: 'success' }
+  const map = { '-1': 'clock-o', 0: 'clock-o', 1: 'paid', 2: 'info-o', 3: 'refund-o', 4: 'success' }
   return map[order.value?.status] || 'info-o'
 })
 

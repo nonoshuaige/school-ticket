@@ -30,7 +30,7 @@
           </div>
           <div class="order-right">
             <span class="order-status" :style="{ color: orderStatusColor(item.status) }">
-              {{ statusLabel(item) }}
+              {{ orderStatusText(item.status) }}
             </span>
             <span class="order-time">{{ formatDateTime(item.createTime) }}</span>
           </div>
@@ -122,12 +122,6 @@ function onTabChange() {
 
 function onPageChange() {
   loadOrders()
-}
-
-function statusLabel(item) {
-  if (item.status === 0) return '待支付'
-  if (item.status === 1) return '已支付'
-  return orderStatusText(item.status)
 }
 
 function countdownInfo(expireTime) {

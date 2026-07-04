@@ -31,7 +31,7 @@ public class OrderLuaService {
     private static final String SOLDOUT_KEY = "ticket:soldout:%d";
     private static final String PURCHASE_KEY = "event:purchase:%d";
     private static final String STREAM_KEY = "stream:orders";
-    private static final String ORDER_CACHE_KEY = "order:%s";
+    public static final String ORDER_CACHE_KEY = "order:%s";
 
     @PostConstruct
     public void init() throws Exception {
@@ -49,21 +49,21 @@ public class OrderLuaService {
     }
 
     /**
-     * 执行购买 Lua 脚本（活动级限购：同一 event 下所有票档合计最多 5 张）
+     * 执行购买 Lua 脚本（原子：扣库存 + 活动级限购 + 写订单缓存 + Stream）
+     * Java 侧已做三层预检（售罄/库存/限购）快速失败，Lua 内仍做安全校验。
      * @return [code, msg]: 0=成功, -1=售罄, -2=库存不足, -3=活动限购超限
      */
     @SuppressWarnings({"unchecked", "rawtypes"})
-    private static final String DEDUP_KEY = "dedup:order:%d:%d";
-
     public List<Object> executePurchase(Long ticketId, Long userId, Long eventId,
-                                        String orderId, int quantity, int totalStock,
-                                        String totalPrice, long expireTimeMs) {
+                                        String orderId, int quantity,
+                                        String totalPrice, long expireTimeMs,
+                                        String orderJson) {
         List<String> keys = List.of(
                 String.format(STOCK_KEY, ticketId),
                 String.format(SOLDOUT_KEY, ticketId),
                 String.format(PURCHASE_KEY, eventId),
                 STREAM_KEY,
-                String.format(DEDUP_KEY, userId, ticketId)
+                String.format(ORDER_CACHE_KEY, orderId)
         );
         String[] args = {
                 orderId,
@@ -71,9 +71,9 @@ public class OrderLuaService {
                 String.valueOf(ticketId),
                 String.valueOf(quantity),
                 "5",
-                String.valueOf(totalStock),
                 totalPrice,
-                String.valueOf(expireTimeMs)
+                String.valueOf(expireTimeMs),
+                orderJson
         };
         return redis.execute(purchaseScript,
                 (RedisSerializer) RedisSerializer.string(),
@@ -144,6 +144,19 @@ public class OrderLuaService {
     public List<String> multiGetOrderCache(List<String> orderNos) {
         List<String> keys = orderNos.stream().map(no -> String.format(ORDER_CACHE_KEY, no)).toList();
         return redis.opsForValue().multiGet(keys);
+    }
+
+    /** 查询 Redis 售罄标记 */
+    public boolean isSoldOut(Long ticketId) {
+        return "1".equals(redis.opsForValue().get(String.format(SOLDOUT_KEY, ticketId)));
+    }
+
+    /** 查询用户在活动下的累计购买数量（Lua HINCRBY 写入整数，需 Object 接收） */
+    public int getPurchaseCount(Long eventId, Long userId) {
+        Object val = redis.opsForHash()
+                .get(String.format(PURCHASE_KEY, eventId), String.valueOf(userId));
+        if (val == null) return 0;
+        return Integer.parseInt(String.valueOf(val));
     }
 
     /**

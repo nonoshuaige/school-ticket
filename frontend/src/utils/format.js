@@ -29,7 +29,7 @@ export function formatDateShort(dateStr) {
  * 订单状态文本
  */
 export function orderStatusText(status) {
-  const map = { 0: '待支付', 1: '已支付', 2: '已取消', 3: '已退款', 4: '已核销' }
+  const map = { '-1': '排队中', 0: '待支付', 1: '已支付', 2: '已取消', 3: '已退款', 4: '已核销' }
   return map[status] || '未知'
 }
 
@@ -37,7 +37,7 @@ export function orderStatusText(status) {
  * 订单状态颜色
  */
 export function orderStatusColor(status) {
-  const map = { 0: '#f57c00', 1: '#4caf50', 2: '#999', 3: '#f44336', 4: '#2196f3' }
+  const map = { '-1': '#2196f3', 0: '#f57c00', 1: '#4caf50', 2: '#999', 3: '#f44336', 4: '#2196f3' }
   return map[status] || '#999'
 }
 

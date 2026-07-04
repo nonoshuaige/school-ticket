@@ -1,6 +1,6 @@
 # 🎫 校园活动票务系统
 
-> Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
+> v4.5 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
 
 ## 项目简介
 
@@ -8,32 +8,36 @@
 
 ## 🎯 核心亮点
 
-### 一、秒杀抢购链路 — Lua 原子操作 + 防重提交 + Caffeine 单飞锁 + 阻塞队列桥接 + RabbitMQ 可靠落库 + 本地消息表回滚
+### 一、秒杀抢购链路 — 四层预检快速失败 + Lua 原子写入 + 排队中状态 + 阻塞队列桥接 + RabbitMQ 可靠落库
 
 ```
 用户请求 POST /order/create { ticketId, quantity }
+  │
+  ├─ 0. 用户级限流（内存 ConcurrentHashMap，每人 1s/次）→ 防脚本/连点
   │
   ├─ 1. Caffeine 本地售罄短路 + 单飞锁（5s TTL）
   │      ├─ 命中 → 返回"已售罄"
   │      └─ 未命中 → per-key 锁 → 单线程查 Redis soldout 标记 → 更新 Caffeine
   │
-  ├─ 2. 无锁 selectById 查票档 + 活动信息
+  ├─ 2. Redis 售罄预检（Java 侧 GET soldout，比 Lua 更快失败）
   │
-  ├─ 3. Snowflake 预生成订单号
+  ├─ 3. Redis 库存预检（GET stock < qty? → 返回售罄）
   │
-  ├─ 4. purchase.lua 原子执行:
-  │      ├─ SET dedup:order:{userId}:{ticketId} EX 1 NX → 防重提交 → -4
+  ├─ 4. Redis 限购预检（HGET event:purchase:{eventId} userId → current+qty > 5?）
+  │        以上三层预检层层削减：售罄概率 > 库存不足 > 单人限购
+  │
+  ├─ 5. Snowflake 预生成订单号 + 构建排队中订单（status=-1）
+  │
+  ├─ 6. purchase.lua 原子执行（安全校验 + 写操作，约 12µs）:
   │      ├─ GET soldout → 已售罄? → -1
   │      ├─ GET stock < qty? → SET soldout=1 → -2
   │      ├─ HGET event:purchase:{eventId} userId → current+qty > 5? → -3
   │      ├─ DECRBY stock
   │      ├─ HINCRBY event:purchase:{eventId} userId qty
+  │      ├─ SET order:{orderNo} = JSON(status=-1 排队中), EX 1800  ← Lua 内写订单
   │      └─ XADD stream:orders (唯一写路径)
   │
-  ├─ 5. Lua 成功 → 写 Redis 订单缓存（微秒级间隙）
-  │      ├─ SET order:{orderNo} = JSON stub, EX 1800
-  │      └─ LPUSH user:orders:{userId} orderNo → LTRIM 0 9
-  │      返回 stub Order（主线程不再直接 INSERT MySQL）
+  ├─ 7. 返回 stub Order（status=-1，前端展示"排队中"蓝色状态）
   │      │
   │      ▼
   │  StreamToRabbitMQBridge (阻塞队列, v4.4)
@@ -45,11 +49,11 @@
   │      ▼
   │  OrderCreateConsumer @RabbitListener
   │      │  INSERT MySQL (唯一落库路径)
-  │      │  刷新 Redis 订单缓存（stub → 完整数据，含 createTime）
+  │      │  刷新 Redis: status=-1(排队中) → status=0(待支付) + 真实 createTime
   │      │  DuplicateKeyException → 幂等跳过
   │      │  异常 → 抛回 RabbitMQ 重试 / DXL
   │      │
-  │      ▼ 查询 GET /order/{orderNo} 或 /order/list → Redis 优先，不穿透 DB
+  │      ▼ 查询 GET /order/{orderNo} 或 /order/list → Redis 优先，全程不穿透 DB
   
   逆向链路（取消/超时关单 / 退款）:
     cancel / expire
@@ -76,14 +80,18 @@
 | 每人囤票 | `event:purchase:{eventId}` Hash 记录 userId→qty，活动级上限 5 张 | 杜绝脚本囤票 |
 | 售罄后无效请求穿透 Redis | Caffeine 本地缓存 `Cache<Long, Boolean>`，5s TTL，仅存售罄=true | 秒级短路，Redis 压力归零 |
 | 订单号全局唯一 | Hutool Snowflake（无中心化依赖） | 预生成，不依赖 DB 自增 |
-| 重复提交/脚本攻击 | purchase.lua 开头 SET NX `dedup:order:{userId}:{ticketId}` EX 1s | 同一用户同一票档 1s 内仅一次提交，后端原子防重 |
-| Caffeine 击穿（过期瞬间大量请求穿透到 Redis） | 单飞锁：per-ticketId synchronized 双重检查，未命中时仅一个线程查 Redis | 同类票档同一时刻仅一次 Redis 查询 |
+| 重复提交/脚本攻击 | 内存限流（ConcurrentHashMap，每人 1s/次）+ 前端按钮 1s 防连点（v4.5） | 双重保护，不占 Redis 内存 |
+| Java 侧预检快速失败 | 售罄→库存→限购 三层 Redis 读（概率递减），无效请求不进 Lua（v4.5） | 减少无效 Lua 调用 |
+| Lua 脚本原子性 | 安全校验 + DECRBY + HINCRBY + SET 订单缓存 + XADD stream 全部在 Lua 内完成（v4.5） | 订单写入无间隙，状态一致 |
+| 订单排队状态 | Lua 写 status=-1（排队中）→ Consumer 落库刷 status=0（待支付）→ 前端区分展示（v4.5） | 查询全程走 Redis，零 DB 穿透 |
+| Caffeine 击穿 | 单飞锁：per-ticketId synchronized 双重检查，未命中时仅一个线程查 Redis | 同类票档同一时刻仅一次 Redis 查询 |
 | Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，RabbitMQ 持久化队列单路径落库（v4.1） | 磁盘级可靠，消息不因 Redis 重启丢失 |
 | 活动缓存击穿 | 逻辑过期 + 互斥锁（SET NX），物理 TTL=逻辑+30min 缓冲，过期返回旧值异步重建（v4.1） | 大量并发不再穿透 DB |
+| Pool 重建空窗期 | 临时 ZSET 构建 + RENAME 原子替换，避免先删后建（v4.5） | 重建期间查询不返回空列表 |
 | 库存恢复 | rollback.lua 原子 INCRBY + DEL soldout + 减少购买记录 | 取消/退款秒级回补 |
 | 逆向链路可靠性 | 本地消息表 `order_event_log`（与业务在同一事务内 INSERT）→ 定时任务扫描 → 执行 Lua → 成功 ack，失败重试最多 5 次 | Redis 临时不可用时不影响返回，最终一致 |
 | 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask 消费执行 → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，削峰填谷 |
-| Caffeine 失效时机 | 不主动 invalidate，依赖 5s TTL 自然过期 + OrderEventLogTask 清除 Redis soldout 标记后缓存冷却 | 避免假售罄循环（见下方说明） |
+| Caffeine 失效时机 | 不主动 invalidate，依赖 5s TTL 自然过期 + OrderEventLogTask 清除 Redis soldout 标记后缓存冷却 | 避免假售罄循环 |
 
 **Caffeine 本地售罄缓存（v4.4 单飞锁）：**
 
@@ -104,7 +112,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 | Redis Key | 类型 | 物理TTL | 逻辑过期 | 用途 |
 |-----------|------|---------|---------|------|
-| `order:{orderNo}` | String | 1800s | — | 订单 JSON 缓存（stub → Consumer 落库后刷新为完整数据） |
+| `order:{orderNo}` | String | 1800s | — | 订单 JSON 缓存（Lua 写入 status=-1 排队中 → Consumer 落库后刷新 status=0 可见） |
 | `user:orders:{userId}` | List | 1800s | — | 用户最近 10 条订单号，LPUSH + LTRIM 维护，首页列表 Redis 直达 |
 | `event:pool:hot` | ZSET | max(saleEndTime)+30min | 每5min 重建 | 热卖中活动 ID，score=eventStartTime |
 | `event:pool:warmup` | ZSET | max(saleStartTime)+1d+30min | 每5min 重建 | 预热中活动 ID |
@@ -378,7 +386,8 @@ npm run dev
 │           │   ├── service/OrderLuaService.java    # Lua 执行 + 库存预热
 │           │   ├── consumer/StreamToRabbitMQBridge.java # Stream→RabbitMQ 桥接 + PEL 兜底
 │           │   ├── consumer/OrderCreateConsumer.java    # RabbitMQ 消费者，唯一落库路径
-│           │   ├── cache/SoldOutCache.java         # Caffeine 售罄缓存
+│           │   ├── cache/SoldOutCache.java         # Caffeine 售罄缓存 + 单飞锁
+│           │   ├── cache/RateLimiter.java          # 用户级请求限流（每人 1s/次）
 │           │   ├── task/OrderTimeoutTask.java      # 超时关单扫描
 │           │   ├── task/OrderEventLogTask.java     # 本地消息表定时处理
 │           │   └── task/RefundTask.java            # 退款表消费任务

@@ -52,7 +52,7 @@ public class OrderCreateConsumer {
             orderMapper.insert(order);
             log.info("订单已落库: orderNo={}, userId={}, ticketId={}", orderNo, userId, ticketId);
 
-            // 刷新 Redis 缓存（stub → 完整数据，含 createTime）
+            // 刷新 Redis：排队中(status=-1) → 可见(status=0，含 DB createTime)
             try {
                 orderLuaService.updateOrderCache(orderNo, objectMapper.writeValueAsString(order));
             } catch (Exception ignored) {}

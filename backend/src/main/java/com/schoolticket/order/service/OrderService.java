@@ -12,6 +12,7 @@ import com.schoolticket.event.entity.Event;
 import com.schoolticket.event.entity.TicketCategory;
 import com.schoolticket.event.mapper.EventMapper;
 import com.schoolticket.event.mapper.TicketCategoryMapper;
+import com.schoolticket.order.cache.RateLimiter;
 import com.schoolticket.order.cache.SoldOutCache;
 import com.schoolticket.order.entity.Order;
 import com.schoolticket.order.entity.OrderEventLog;
@@ -48,6 +49,7 @@ public class OrderService {
     private final EventMapper eventMapper;
     private final OrderLuaService orderLuaService;
     private final SoldOutCache soldOutCache;
+    private final RateLimiter rateLimiter;
     private final ObjectMapper objectMapper;
 
     private static final int EXPIRE_MINUTES = 15;
@@ -55,39 +57,72 @@ public class OrderService {
     // ===================== 核心履约 =====================
 
     /**
-     * 创建订单（Redis Lua 原子扣库存 + Stream 写入 + RabbitMQ 异步落库）
+     * 创建订单（四层预检快速失败 + Lua 原子写入）
      *
-     * 主线程只做 Lua（含 XADD stream），不再直接 INSERT MySQL。
-     * StreamToRabbitMQBridge → RabbitMQ → OrderCreateConsumer 是唯⼀落库路径。
-     * 防重提交由前端按钮防连点控制，后端不再做幂等保护。
+     * 预检链: 用户限流 → Caffeine售罄 → Redis售罄 → Redis库存 → Redis限购（概率递减）
+     * Lua 内仍做安全校验，并原子写入订单缓存(status=-1排队中) + Stream。
+     * Consumer 落库后刷新缓存 status=0，订单变为可见。
+     * 全程查询走 Redis，不穿透 DB。
      */
     public Order createOrder(Long userId, OrderCreateReq req) {
-        // 1. 本地售罄缓存短路 + 单飞锁查Redis（防Caffeine过期瞬间击穿）
+        // 0. 用户级请求频率限制（每人每秒最多1次，防脚本/连点）
+        if (rateLimiter.isRateLimited(userId)) {
+            throw new BusinessException("操作太频繁，请稍后再试");
+        }
+
+        // 1. Caffeine 本地售罄缓存短路
         if (soldOutCache.checkSoldOut(req.getTicketId())) {
             throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
         }
 
-        // 2. 查票档信息（无锁 selectById）
+        // 2. Redis 售罄标记（Java 侧快速失败，减少无效 Lua 调用）
+        if (orderLuaService.isSoldOut(req.getTicketId())) {
+            soldOutCache.markSoldOut(req.getTicketId());
+            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+        }
+
+        // 3. 查票档 + 活动信息
         TicketCategory ticket = ticketCategoryMapper.selectById(req.getTicketId());
         if (ticket == null) {
             throw new BusinessException(BusinessException.INVALID_PARAM, "票档不存在");
         }
-
         Event event = eventMapper.selectById(ticket.getEventId());
         if (event == null) {
             throw new BusinessException(BusinessException.INVALID_PARAM, "活动不存在");
         }
 
-        // 3. 预生成订单号
+        // 4. Redis 库存预检（快速失败，减少无效 Lua 调用）
+        Integer stock = orderLuaService.getStock(req.getTicketId());
+        if (stock != null && stock < req.getQuantity()) {
+            soldOutCache.markSoldOut(req.getTicketId());
+            throw new BusinessException(BusinessException.TICKET_SOLD_OUT, "该票档已售罄");
+        }
+
+        // 5. 活动级限购预检（同一活动所有票档合计最多 5 张）
+        int purchased = orderLuaService.getPurchaseCount(event.getEventId(), userId);
+        if (purchased + req.getQuantity() > 5) {
+            throw new BusinessException("该活动累计最多购买5张，已购" + purchased + "张");
+        }
+
+        // 6. 预生成订单号，构建排队中订单
         String orderNo = IdUtil.getSnowflakeNextIdStr();
         BigDecimal totalPrice = ticket.getPrice().multiply(BigDecimal.valueOf(req.getQuantity()));
         long expireTimeMs = LocalDateTime.now().plusMinutes(EXPIRE_MINUTES)
                 .atZone(ZoneId.of("Asia/Shanghai")).toInstant().toEpochMilli();
 
-        // 4. 执行 Lua 脚本（原子: 扣库存 + 活动级限购 + XADD stream）
+        Order stub = buildStubOrder(orderNo, userId, req, totalPrice, ticket);
+        stub.setStatus(-1); // 排队中：Lua 已写 Redis，尚未落库
+        String orderJson;
+        try {
+            orderJson = objectMapper.writeValueAsString(stub);
+        } catch (Exception e) {
+            throw new BusinessException("订单序列化失败");
+        }
+
+        // 7. 执行 Lua（原子：安全校验 + 扣库存 + 限购 + 写订单缓存 + Stream）
         List<Object> result = orderLuaService.executePurchase(
                 req.getTicketId(), userId, event.getEventId(), orderNo,
-                req.getQuantity(), ticket.getTotalQuantity(), totalPrice.toString(), expireTimeMs);
+                req.getQuantity(), totalPrice.toString(), expireTimeMs, orderJson);
 
         long code = result.get(0) instanceof Long ? (Long) result.get(0)
                 : ((Number) result.get(0)).longValue();
@@ -99,19 +134,14 @@ public class OrderService {
         if (code == -3) {
             throw new BusinessException("该活动累计最多购买5张");
         }
-        if (code == -4) {
-            throw new BusinessException(BusinessException.DUPLICATE_REQUEST, "请勿重复提交订单");
-        }
 
-        log.info("订单创建(Stream): orderNo={}, userId={}, ticketId={}, qty={}",
-                orderNo, userId, req.getTicketId(), req.getQuantity());
-
-        // 5. Lua 成功后立即写 Redis：订单缓存 + 用户列表（后续查询不穿透 DB）
-        Order stub = buildStubOrder(orderNo, userId, req, totalPrice, ticket);
+        // 8. 用户订单列表（best effort，主流程已完成）
         try {
-            orderLuaService.updateOrderCache(orderNo, objectMapper.writeValueAsString(stub));
             orderLuaService.pushUserOrderList(userId, orderNo);
         } catch (Exception ignored) {}
+
+        log.info("订单创建(排队中): orderNo={}, userId={}, ticketId={}, qty={}",
+                orderNo, userId, req.getTicketId(), req.getQuantity());
         return stub;
     }
 
