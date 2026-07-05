@@ -1,6 +1,6 @@
 # 🎫 校园活动票务系统
 
-> v4.5 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
+> v4.7 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
 
 ## 项目简介
 
@@ -8,7 +8,7 @@
 
 ## 🎯 核心亮点
 
-### 一、秒杀抢购链路 — 四层预检快速失败 + Lua 原子写入 + 排队中状态 + 阻塞队列桥接 + RabbitMQ 可靠落库
+### 一、秒杀抢购链路 — 四层预检快速失败 + Lua 原子写入 + 排队中状态 + RabbitMQ Confirm + MySQL 库存一致
 
 ```
 用户请求 POST /order/create { ticketId, quantity }
@@ -42,9 +42,9 @@
   │      ▼
   │  StreamToRabbitMQBridge (阻塞队列, v4.6)
   │      │  Reader 线程 XREAD BLOCK → LinkedBlockingQueue
-  │      │  Worker×4 take() → 同时投递 order.create / order.delay → XACK
+  │      │  Worker×4 take() → 同时投递 order.create / order.delay → 两条消息均收到 publisher confirm ack 后 XACK
   │      │
-  │      │  PEL 兜底 (每 5s): XPENDING → 卡住 >5s → 重投 RabbitMQ → XACK
+  │      │  PEL 兜底 (每 5s): XPENDING → 卡住 >5s → 重投 RabbitMQ → confirm ack 后 XACK
   │      │
   │      ├─ order.create.queue → OrderCreateConsumer 唯一落库
   │      └─ order.delay.queue(TTL=15min) → order.close.queue 超时关单
@@ -56,7 +56,7 @@
   │      │
   │      ▼
   │  OrderCreateConsumer @RabbitListener
-  │      │  INSERT MySQL (唯一落库路径)
+  │      │  INSERT order + 原子扣减 MySQL ticket_category.remaining_quantity (同事务)
   │      │  刷新 Redis: status=-1(排队中) → status=0(待支付) + 真实 createTime
   │      │  DuplicateKeyException → 幂等跳过
   │      │  异常 → 抛回 RabbitMQ 重试 / DXL
@@ -66,8 +66,8 @@
   逆向链路（取消/超时关单 / 退款）:
     cancel / expire
       │
-      ├─ MySQL 事务内: CAS UPDATE order status + 回补 remaining
-      │         └─ INSERT order_event_log (status=0)
+      ├─ MySQL 事务内: CAS UPDATE order status + 原子回补 remaining
+      │         └─ INSERT order_event_log (status=0，任务处理前 CAS 抢占为 status=9)
       │              → OrderEventLogTask 每 10s → rollback.lua → ack
       └─ Caffeine 不主动 invalidate，5s TTL 自然过期
 
@@ -75,7 +75,7 @@
       │
       ├─ INSERT refund (status=0) → 立即返回
       ├─ RefundTask 每 10s 消费 → 回补 + UPDATE status=3
-      │         └─ INSERT order_event_log → 驱动 Redis 回滚
+      │         └─ INSERT order_event_log → 驱动 Redis 回滚（重复退款事件幂等跳过）
       └─ Caffeine 不主动 invalidate，5s TTL 自然过期
 ```
 
@@ -94,12 +94,14 @@
 | 订单排队状态 | Lua 写 status=-1（排队中）→ Consumer 落库刷 status=0（待支付）→ 前端区分展示（v4.5） | 查询全程走 Redis，零 DB 穿透 |
 | Caffeine 击穿 | 单飞锁：per-ticketId tryLock，抢到锁才回查 Redis，锁竞争失败快速返回（v4.6） | 同类票档同一时刻仅一次 Redis 查询，不放大线程等待 |
 | Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，同时投递成单队列与延时关单队列（v4.6） | 磁盘级可靠，消息不因 Redis 重启丢失 |
+| MQ 投递确认窗口 | RabbitMQ `publisher-confirm-type=correlated`，成单与延时两条消息均 confirm ack 后才 XACK Redis Stream（v4.7） | 避免 publish 未被 broker 确认时提前 ack Stream |
+| MySQL 库存口径 | OrderCreateConsumer 插入订单与 `remaining_quantity -= qty` 同事务；取消/退款/超时使用原子 `remaining_quantity += qty`（v4.7） | Redis 热库存与 MySQL 最终库存对称一致 |
 | 支付/关单状态冲突 | 状态机 + CAS 条件更新（status 前置条件 + expire_time 条件） | 支付、取消、超时、退款、核销并发时仅一个流转成功 |
 | 活动缓存击穿 | 逻辑过期 + 互斥锁（SET NX），物理 TTL=逻辑+30min 缓冲，过期返回旧值异步重建（v4.1） | 大量并发不再穿透 DB |
 | Pool 重建空窗期 | 临时 ZSET 构建 + RENAME 原子替换，避免先删后建（v4.5） | 重建期间查询不返回空列表 |
 | 库存恢复 | rollback.lua 原子 INCRBY + DEL soldout + 减少购买记录 | 取消/退款秒级回补 |
-| 逆向链路可靠性 | 本地消息表 `order_event_log`（与业务在同一事务内 INSERT）→ 定时任务扫描 → 执行 Lua → 成功 ack，失败重试最多 5 次 | Redis 临时不可用时不影响返回，最终一致 |
-| 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask 消费执行 → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，削峰填谷 |
+| 逆向链路可靠性 | 本地消息表 `order_event_log`（与业务在同一事务内 INSERT）→ 定时任务 CAS 抢占 `0→9` → 执行 Lua → 成功 ack，失败释放或重试最多 5 次 | Redis 临时不可用时不影响返回，最终一致且避免重复回滚 |
+| 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask CAS 抢占 `0→9` → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，重复消费幂等跳过 |
 | Caffeine 失效时机 | 不主动 invalidate，依赖 5s TTL 自然过期 + OrderEventLogTask 清除 Redis soldout 标记后缓存冷却 | 避免假售罄循环 |
 
 **Caffeine 本地售罄缓存（v4.6 单飞锁快速失败）：**
@@ -116,7 +118,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 // 假售罄修复：Redis soldout 标记由 OrderEventLogTask 清除，缓存过期后下次查询正确状态
 ```
 
-**库存预热：** 热卖中活动的票档库存预先写入 Redis `ticket:stock:{ticketId}` Key，TTL=活动结束时间，Lua 执行 DECRBY 无需回源 MySQL。
+**库存预热与一致性：** 热卖中活动的票档库存预先写入 Redis `ticket:stock:{ticketId}` Key，TTL=活动结束时间，Lua 执行 DECRBY 无需回源 MySQL；成单消费者异步落库时同步原子扣减 MySQL `remaining_quantity`，取消/退款/超时再原子回补，保持热库存与最终库存口径对称。
 
 **活动信息缓存（v3.9 / v3.12 / v4.1 逻辑过期）：** 活动列表和详情查询改为 Redis 优先、MySQL 兜底。v4.1 引入逻辑过期 + 互斥锁防击穿：缓存 value 包裹 `{"expireAt":...,"data":{...}}`，物理 TTL=逻辑过期+30min 缓冲。逻辑过期时返回旧值并异步重建，大量并发不再穿透 DB。v3.12 将 status 改为实时计算字段。
 
@@ -204,6 +206,14 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 > 推荐流冷启动 ~420ms（含 Lettuce 首连接 ~220ms），热路径 **23-30ms**。
 
+**Feed 体验与关注状态优化（v4.7）：**
+
+- 推荐流不再在每次进入 `/notes` 时强制刷新：仅下拉刷新生成新快照，继续下滑复用 `feed:recommend:{userId}` 私有队列 `LPOP pageSize`。
+- 前端使用 `sessionStorage` 保存当前 Feed Tab、列表、游标和滚动位置，进入笔记详情后返回可恢复原列表和原滚动位置。
+- 滚动接近底部自动触发 `loadMore`，同时保留"加载更多"按钮作为显式兜底。
+- 新增 `POST /api/v1/user/follow/check/batch` 批量关注检查接口，替代 Feed 卡片逐条 `checkFollowing`，消除前端 N+1 请求。
+- 批量接口使用 `/check/batch` 多段路径，避免被 `POST /user/follow/{userId}` 误匹配。
+
 **关注流链路（v3.11 推拉结合）：**
 
 | Redis Key | 类型 | TTL | 用途 |
@@ -218,7 +228,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 - **发帖分支**（`feed.big-v-threshold: 1000`）：粉丝 < 1000 → 推，fanout 到粉丝收件箱；粉丝 ≥ 1000 → 拉，仅写 `note:mine` + 标记 `bigv:ids`
 - **读时合并**：收件箱（普通关注者推内容）+ 大V `note:mine` 拉取 → 按时间戳降序合并 → 游标分页
-- **关注联动**：关注时回填被关注者最近 50 条到收件箱 + 检查是否触发大V 标记；取关时清除收件箱该项 + 检查是否摘除大V 标记
+- **关注联动**：关注/取关在主流程同步维护收件箱（关注回填最近 50 条，取关清理该作者笔记）+ RabbitMQ 异步兜底，避免 MQ 未启动时关注关系已生效但关注流缺旧笔记；同时检查是否触发/摘除大V 标记
 
 **按用户懒加载 + TTL 过期（v3.6）：**
 
@@ -263,6 +273,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 **设计要点：**
 - `note_event` 多对多表以代理自增主键 + 唯一约束解耦笔记与活动
 - 种草数据按需懒加载：不活跃笔记不占 Redis 内存，与 VO 缓存模式一致
+- v4.7 修复空活动关联缓存穿透：`note:events:{noteId}` 空串表示"已缓存且无关联活动"，读取时同样视为命中，不再反复查 MySQL
 - 活动摘要复用现有 `event:vo:{eventId}` JSON 缓存，与活动列表共享
 - 10 条测试种草笔记，内容与关联活动精确对应
 
@@ -371,8 +382,9 @@ npm run dev
 | POST | /api/v1/note/create | 发布笔记（支持 eventIds 关联活动种草） |
 | POST | /api/v1/note/{id}/like | 点赞 |
 | GET | /api/v1/note/{id}/comment | 评论列表（二级展平） |
-| POST | /api/v1/user/{id}/follow | 关注用户（触发回填） |
-| DELETE | /api/v1/user/{id}/follow | 取消关注（触发清除） |
+| POST | /api/v1/user/follow/{id} | 关注用户（同步回填收件箱 + MQ 兜底） |
+| DELETE | /api/v1/user/follow/{id} | 取消关注（同步清理收件箱 + MQ 兜底） |
+| POST | /api/v1/user/follow/check/batch | 批量检查当前用户是否关注作者（Feed 卡片用） |
 
 ---
 
