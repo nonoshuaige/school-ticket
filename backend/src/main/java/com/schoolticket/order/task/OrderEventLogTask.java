@@ -50,6 +50,9 @@ public class OrderEventLogTask {
 
         log.info("消息表扫描: 发现 {} 条待处理事件", pending.size());
         for (OrderEventLog event : pending) {
+            if (orderEventLogMapper.claimPending(event.getId()) == 0) {
+                continue;
+            }
             try {
                 TicketCategory ticket = ticketCategoryMapper.selectById(event.getTicketId());
                 if (ticket == null) {
@@ -67,10 +70,13 @@ public class OrderEventLogTask {
             } catch (Exception e) {
                 log.error("消息表回滚失败: orderNo={}, retry={}",
                         event.getOrderNo(), event.getRetryCount(), e);
-                event.setRetryCount(event.getRetryCount() + 1);
-                if (event.getRetryCount() >= MAX_RETRY) {
+                int retryCount = event.getRetryCount() + 1;
+                event.setRetryCount(retryCount);
+                if (retryCount >= MAX_RETRY) {
                     event.setStatus(2);
                     log.error("消息表标记失败: orderNo={}, 已达最大重试次数", event.getOrderNo());
+                } else {
+                    event.setStatus(0);
                 }
                 orderEventLogMapper.updateById(event);
             }

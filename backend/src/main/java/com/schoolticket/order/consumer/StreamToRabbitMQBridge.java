@@ -6,6 +6,7 @@ import jakarta.annotation.PreDestroy;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.amqp.rabbit.connection.CorrelationData;
 import org.springframework.data.domain.Range;
 import org.springframework.data.redis.connection.stream.*;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -15,6 +16,7 @@ import org.springframework.stereotype.Component;
 import java.time.Duration;
 import java.util.*;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Stream → RabbitMQ 桥接 + PEL 兜底
@@ -161,11 +163,22 @@ public class StreamToRabbitMQBridge {
         }
     }
 
-    private void publishOrderMessages(Map<String, Object> msg) {
-        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
-                RabbitMQConfig.RK_ORDER_CREATE, msg);
-        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE,
-                RabbitMQConfig.RK_ORDER_DELAY, msg);
+    private void publishOrderMessages(Map<String, Object> msg) throws Exception {
+        publishAndWaitConfirm(RabbitMQConfig.RK_ORDER_CREATE, msg);
+        publishAndWaitConfirm(RabbitMQConfig.RK_ORDER_DELAY, msg);
+    }
+
+    private void publishAndWaitConfirm(String routingKey, Map<String, Object> msg) throws Exception {
+        CorrelationData correlationData = new CorrelationData(
+                routingKey + ":" + msg.get("orderId") + ":" + UUID.randomUUID());
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, routingKey, msg, correlationData);
+
+        CorrelationData.Confirm confirm = correlationData.getFuture().get(5, TimeUnit.SECONDS);
+        if (!confirm.isAck()) {
+            throw new IllegalStateException("RabbitMQ publish nacked: routingKey=" + routingKey
+                    + ", orderId=" + msg.get("orderId")
+                    + ", reason=" + confirm.getReason());
+        }
     }
 
     private boolean isStopping(Exception e) {

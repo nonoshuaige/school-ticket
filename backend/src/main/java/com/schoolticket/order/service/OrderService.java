@@ -308,6 +308,11 @@ public class OrderService {
             throw new BusinessException(BusinessException.ORDER_STATUS_ERROR, "订单状态已变化，无法退款");
         }
 
+        if (orderEventLogMapper.countActiveEvent(orderNo, 2) > 0) {
+            log.info("Refund already processed, skip stock replenish: orderNo={}", orderNo);
+            return;
+        }
+
         replenishTicket(order);
 
         writeEventLog(order, 2);
@@ -426,10 +431,9 @@ public class OrderService {
      * 回补票档名额（MySQL 层面）
      */
     private void replenishTicket(Order order) {
-        TicketCategory ticket = ticketCategoryMapper.selectById(order.getTicketId());
-        if (ticket != null) {
-            ticket.setRemainingQuantity(ticket.getRemainingQuantity() + order.getQuantity());
-            ticketCategoryMapper.updateById(ticket);
+        int updated = ticketCategoryMapper.replenishStock(order.getTicketId(), order.getQuantity());
+        if (updated == 0) {
+            throw new BusinessException("Ticket not found, cannot replenish stock");
         }
     }
 

@@ -1,6 +1,7 @@
 package com.schoolticket.order.consumer;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.schoolticket.event.mapper.TicketCategoryMapper;
 import com.schoolticket.order.entity.Order;
 import com.schoolticket.order.mapper.OrderMapper;
 import com.schoolticket.order.service.OrderLuaService;
@@ -9,6 +10,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Component;
+import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -26,10 +28,12 @@ import java.util.Map;
 public class OrderCreateConsumer {
 
     private final OrderMapper orderMapper;
+    private final TicketCategoryMapper ticketCategoryMapper;
     private final OrderLuaService orderLuaService;
     private final ObjectMapper objectMapper;
 
     @RabbitListener(queues = "#{orderCreateQueue.name}", containerFactory = "orderRabbitListenerContainerFactory")
+    @Transactional
     public void handleOrderCreate(Map<String, Object> msg) {
         try {
             String orderNo   = (String) msg.get("orderId");
@@ -50,6 +54,11 @@ public class OrderCreateConsumer {
                     Instant.ofEpochMilli(expireTimeMs), ZoneId.of("Asia/Shanghai")));
 
             orderMapper.insert(order);
+            int stockUpdated = ticketCategoryMapper.deductStock(ticketId, quantity);
+            if (stockUpdated == 0) {
+                throw new IllegalStateException("MySQL stock deduct failed: orderNo=" + orderNo
+                        + ", ticketId=" + ticketId + ", quantity=" + quantity);
+            }
             log.info("订单已落库: orderNo={}, userId={}, ticketId={}", orderNo, userId, ticketId);
 
             // 刷新 Redis：排队中(status=-1) → 可见(status=0，含 DB createTime)
