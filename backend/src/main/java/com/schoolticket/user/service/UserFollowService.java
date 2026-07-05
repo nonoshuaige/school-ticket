@@ -57,6 +57,8 @@ public class UserFollowService {
         }
 
         // RabbitMQ 异步通知
+        noteRankingService.backfillInboxForNewFan(followerId, userId);
+
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", "follow");
         msg.put("followerId", followerId);
@@ -79,6 +81,8 @@ public class UserFollowService {
             noteRankingService.unmarkBigV(userId);
         }
 
+        noteRankingService.removeAuthorFromInbox(followerId, userId);
+
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", "unfollow");
         msg.put("followerId", followerId);
@@ -93,6 +97,24 @@ public class UserFollowService {
                 new LambdaQueryWrapper<UserFollow>()
                         .eq(UserFollow::getFollowerId, followerId)
                         .eq(UserFollow::getUserId, userId)) > 0;
+    }
+
+    public Map<Long, Boolean> batchCheckFollowing(Long followerId, List<Long> userIds) {
+        Map<Long, Boolean> result = new LinkedHashMap<>();
+        if (userIds == null || userIds.isEmpty()) return result;
+
+        List<Long> distinctIds = userIds.stream()
+                .filter(Objects::nonNull)
+                .distinct()
+                .collect(Collectors.toList());
+        if (distinctIds.isEmpty()) return result;
+
+        redisFollowService.ensureFollowLoaded(followerId);
+        Map<Long, Long> followed = redisFollowService.getFollowTimes(followerId, new LinkedHashSet<>(distinctIds));
+        for (Long userId : distinctIds) {
+            result.put(userId, followed.containsKey(userId));
+        }
+        return result;
     }
 
     public Map<String, Object> getFollowStats(Long userId) {

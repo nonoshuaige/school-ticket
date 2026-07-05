@@ -85,13 +85,15 @@
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast, showSuccessToast } from 'vant'
 import { getRecommendFeed, getFollowingFeed, createNote, likeNote, unlikeNote } from '../api/note'
-import { followUser, unfollowUser, checkFollowing } from '../api/user'
+import { followUser, unfollowUser, checkFollowingBatch } from '../api/user'
 import { useUserStore } from '../stores/user'
 import BottomNav from '../components/BottomNav.vue'
+
+const FEED_CACHE_KEY = 'notes-feed-state'
 
 const router = useRouter()
 const userStore = useUserStore()
@@ -118,6 +120,29 @@ const gradients = [
 ]
 const emojis = ['🌸','🎵','📖','🍔','🏃','📷','🎮','✨','🌈','🎨','🍕','🎬','📝','💡','🌟','🔥']
 
+function readFeedCache() {
+  try {
+    const raw = sessionStorage.getItem(FEED_CACHE_KEY)
+    return raw ? JSON.parse(raw) : null
+  } catch {
+    return null
+  }
+}
+
+function saveFeedCache() {
+  sessionStorage.setItem(FEED_CACHE_KEY, JSON.stringify({
+    feedMode: feedMode.value,
+    notes: notes.value,
+    nextCursor: nextCursor.value,
+    hasMore: hasMore.value,
+    scrollTop: window.scrollY || document.documentElement.scrollTop || 0
+  }))
+}
+
+function clearFeedCache() {
+  sessionStorage.removeItem(FEED_CACHE_KEY)
+}
+
 function coverGradient(id) { return gradients[id % gradients.length] }
 function coverEmoji(id) { return emojis[id % emojis.length] }
 
@@ -137,39 +162,54 @@ function switchFeed(mode) {
   feedMode.value = mode
   nextCursor.value = null
   notes.value = []
+  clearFeedCache()
   loadNotes()
+}
+
+async function applyFollowingStatus(records) {
+  if (!userStore.isLoggedIn) {
+    records.forEach(r => { r.isFollowing = false; r._loaded = true })
+    return
+  }
+
+  const selfId = userStore.userInfo?.userId
+  const authorIds = [...new Set(records
+    .map(item => item.userId)
+    .filter(userId => userId && userId !== selfId))]
+
+  let followingMap = {}
+  if (authorIds.length > 0) {
+    try {
+      followingMap = await checkFollowingBatch(authorIds)
+    } catch {
+      followingMap = {}
+    }
+  }
+
+  records.forEach(item => {
+    item.isFollowing = item.userId === selfId ? false : Boolean(followingMap[String(item.userId)])
+    item._loaded = true
+  })
+}
+
+function fetchFeedPage() {
+  if (feedMode.value === 'recommend') {
+    return getRecommendFeed({ cursor: nextCursor.value, pageSize })
+  }
+  return getFollowingFeed({ cursor: nextCursor.value, pageSize })
 }
 
 async function loadNotes() {
   loading.value = true
   try {
-    let res
-    if (feedMode.value === 'recommend') {
-      res = await getRecommendFeed({ cursor: nextCursor.value, pageSize })
-    } else {
-      res = await getFollowingFeed({ cursor: nextCursor.value, pageSize })
-    }
+    const res = await fetchFeedPage()
     const records = res.records || []
-
-    // 批量查关注状态
-    if (userStore.isLoggedIn) {
-      for (const item of records) {
-        if (item.userId === userStore.userInfo?.userId) {
-          item.isFollowing = false
-        } else {
-          try {
-            item.isFollowing = await checkFollowing(item.userId)
-          } catch { item.isFollowing = false }
-        }
-        item._loaded = true
-      }
-    } else {
-      records.forEach(r => { r.isFollowing = false; r._loaded = true })
-    }
+    await applyFollowingStatus(records)
 
     notes.value = records
     nextCursor.value = res.nextCursor || null
     hasMore.value = res.hasMore || false
+    saveFeedCache()
   } catch {} finally {
     loading.value = false
   }
@@ -179,40 +219,33 @@ async function loadMore() {
   if (!hasMore.value || loadingMore.value) return
   loadingMore.value = true
   try {
-    let res
-    if (feedMode.value === 'recommend') {
-      res = await getRecommendFeed({ cursor: nextCursor.value, pageSize })
-    } else {
-      res = await getFollowingFeed({ cursor: nextCursor.value, pageSize })
-    }
+    const res = await fetchFeedPage()
     const records = res.records || []
-
-    if (userStore.isLoggedIn) {
-      for (const item of records) {
-        if (item.userId === userStore.userInfo?.userId) {
-          item.isFollowing = false
-        } else {
-          try {
-            item.isFollowing = await checkFollowing(item.userId)
-          } catch { item.isFollowing = false }
-        }
-        item._loaded = true
-      }
-    } else {
-      records.forEach(r => { r.isFollowing = false; r._loaded = true })
-    }
+    await applyFollowingStatus(records)
 
     notes.value.push(...records)
     nextCursor.value = res.nextCursor || null
     hasMore.value = res.hasMore || false
+    saveFeedCache()
   } catch {} finally {
     loadingMore.value = false
+  }
+}
+
+function handleWindowScroll() {
+  if (loading.value || loadingMore.value || !hasMore.value) return
+  const scrollTop = window.scrollY || document.documentElement.scrollTop || 0
+  const viewportHeight = window.innerHeight || document.documentElement.clientHeight
+  const scrollHeight = document.documentElement.scrollHeight
+  if (scrollHeight - scrollTop - viewportHeight < 160) {
+    loadMore()
   }
 }
 
 async function onRefresh() {
   refreshing.value = true
   nextCursor.value = null
+  clearFeedCache()
   await loadNotes()
   refreshing.value = false
 }
@@ -227,10 +260,12 @@ async function toggleLike(item) {
       await unlikeNote(item.noteId)
       item.isLiked = false
       item.likeCount = Math.max(0, (item.likeCount || 0) - 1)
+      saveFeedCache()
     } else {
       await likeNote(item.noteId)
       item.isLiked = true
       item.likeCount = (item.likeCount || 0) + 1
+      saveFeedCache()
     }
   } catch {}
 }
@@ -250,6 +285,7 @@ async function beforePublish(action) {
     publishContent.value = ''
     showSuccessToast('发布成功')
     nextCursor.value = null
+    clearFeedCache()
     await loadNotes()
     return true
   } catch {
@@ -267,15 +303,35 @@ async function toggleFollow(item) {
       await unfollowUser(item.userId)
       item.isFollowing = false
       showToast('已取消关注')
+      saveFeedCache()
     } else {
       await followUser(item.userId)
       item.isFollowing = true
       showToast('关注成功')
+      saveFeedCache()
     }
   } catch {}
 }
 
-onMounted(() => { loadNotes() })
+onMounted(async () => {
+  window.addEventListener('scroll', handleWindowScroll, { passive: true })
+  const cached = readFeedCache()
+  if (cached && Array.isArray(cached.notes)) {
+    feedMode.value = cached.feedMode || 'recommend'
+    notes.value = cached.notes
+    nextCursor.value = cached.nextCursor || null
+    hasMore.value = Boolean(cached.hasMore)
+    await nextTick()
+    window.scrollTo(0, cached.scrollTop || 0)
+    return
+  }
+  loadNotes()
+})
+
+onBeforeUnmount(() => {
+  window.removeEventListener('scroll', handleWindowScroll)
+  saveFeedCache()
+})
 </script>
 
 <style scoped>

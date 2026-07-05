@@ -74,11 +74,15 @@ public class RedisNoteRankingService {
 
         for (int i = 0; i < noteIds.size(); i++) {
             Object obj = results.get(i);
-            if (obj instanceof String s && !s.isEmpty()) {
-                List<Long> eventIds = java.util.Arrays.stream(s.split(","))
-                        .map(Long::valueOf)
-                        .collect(java.util.stream.Collectors.toList());
-                result.put(noteIds.get(i), eventIds);
+            if (obj instanceof String s) {
+                if (s.isEmpty()) {
+                    result.put(noteIds.get(i), Collections.emptyList());
+                } else {
+                    List<Long> eventIds = java.util.Arrays.stream(s.split(","))
+                            .map(Long::valueOf)
+                            .collect(java.util.stream.Collectors.toList());
+                    result.put(noteIds.get(i), eventIds);
+                }
             }
         }
         return result;
@@ -147,6 +151,7 @@ public class RedisNoteRankingService {
 
     /** 新粉丝关注时，将被关注者的最近笔记补推到这个粉丝的收件箱 */
     public void backfillInboxForNewFan(Long fanId, Long authorId) {
+        ensureMineLoaded(authorId);
         Set<String> recentIds = redis.opsForZSet().reverseRange(
                 String.format(KEY_MINE, authorId), 0, 49);
         if (recentIds == null || recentIds.isEmpty()) return;
@@ -162,6 +167,7 @@ public class RedisNoteRankingService {
 
     /** 取关时清除该用户笔记 */
     public void removeAuthorFromInbox(Long fanId, Long authorId) {
+        ensureMineLoaded(authorId);
         Set<String> authorNoteIds = redis.opsForZSet().range(
                 String.format(KEY_MINE, authorId), 0, -1);
         if (authorNoteIds == null || authorNoteIds.isEmpty()) return;

@@ -6,6 +6,8 @@ import com.schoolticket.user.service.UserFollowService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
+
 @RestController
 @RequestMapping("/api/v1/user/follow")
 @RequiredArgsConstructor
@@ -37,6 +39,13 @@ public class UserFollowController {
     public Result<?> check(@PathVariable Long userId) {
         Long currentUserId = CurrentUserHolder.getUserId();
         return Result.success(userFollowService.isFollowing(currentUserId, userId));
+    }
+
+    /** 批量检查当前用户是否关注这些用户 */
+    @PostMapping("/check/batch")
+    public Result<?> checkBatch(@RequestBody List<Long> userIds) {
+        Long currentUserId = CurrentUserHolder.getUserId();
+        return Result.success(userFollowService.batchCheckFollowing(currentUserId, userIds));
     }
 
     /** 我的关注列表 - 游标分页 */
