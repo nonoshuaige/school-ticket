@@ -8,6 +8,7 @@ import com.schoolticket.note.mapper.NoteMapper;
 import com.schoolticket.user.entity.User;
 import com.schoolticket.user.mapper.UserMapper;
 import lombok.RequiredArgsConstructor;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -30,6 +31,8 @@ public class RedisNoteRankingService {
     private static final String KEY_LATEST  = "note:latest";
     private static final String KEY_MINE    = "note:mine:%d";
     private static final String FEED_FOLLOWING_KEY = "feed:following:%d";
+    private static final String USER_ACTIVE_KEY = "user:active:%d";
+    private static final String AUTHOR_ACTIVE_FANS_KEY = "author:active_fans:%d";
     private static final String VO_KEY       = "note:vo:%d";
     private static final String LIKE_COUNT_KEY = "note:like:count:%d";
     private static final String USER_LIKES_KEY = "user:likes:%d";
@@ -40,6 +43,9 @@ public class RedisNoteRankingService {
     private static final long   LIKE_COUNT_TTL_SECONDS = 604800;
     private static final long   USER_LIKES_TTL_SECONDS = 259200;
     private static final long   FOLLOW_FEED_TTL_SECONDS = 259200;
+
+    @Value("${feed.active-days:7}")
+    private int activeDays;
 
     // ==================== 笔记关联活动缓存（note:events:{noteId}） ====================
 
@@ -138,6 +144,41 @@ public class RedisNoteRankingService {
         }
     }
 
+    /** 发布笔记时只 fanout 到最近活跃粉丝 */
+    public Set<Long> getActiveFanIds(Long authorId) {
+        String key = String.format(AUTHOR_ACTIVE_FANS_KEY, authorId);
+        long now = System.currentTimeMillis();
+        long cutoff = now - TimeUnit.DAYS.toMillis(activeDays);
+        redis.opsForZSet().removeRangeByScore(key, 0, cutoff - 1);
+        redis.expire(key, activeDays + 1L, TimeUnit.DAYS);
+        Set<String> members = redis.opsForZSet().rangeByScore(key, cutoff, Long.MAX_VALUE);
+        if (members == null || members.isEmpty()) return Collections.emptySet();
+        return members.stream().map(Long::valueOf).collect(Collectors.toSet());
+    }
+
+    /** 访问 /notes 或关注流时刷新用户活跃状态，并加入其关注作者的活跃粉丝集合 */
+    public void markUserActive(Long userId, Set<Long> followingIds) {
+        if (userId == null) return;
+        long now = System.currentTimeMillis();
+        String activeKey = String.format(USER_ACTIVE_KEY, userId);
+        redis.opsForValue().set(activeKey, String.valueOf(now), activeDays + 1L, TimeUnit.DAYS);
+
+        if (followingIds == null || followingIds.isEmpty()) return;
+        long cutoff = now - TimeUnit.DAYS.toMillis(activeDays);
+        for (Long authorId : followingIds) {
+            String key = String.format(AUTHOR_ACTIVE_FANS_KEY, authorId);
+            redis.opsForZSet().add(key, String.valueOf(userId), now);
+            redis.opsForZSet().removeRangeByScore(key, 0, cutoff - 1);
+            redis.expire(key, activeDays + 1L, TimeUnit.DAYS);
+        }
+    }
+
+    /** 取关时从作者活跃粉丝集合移除，避免中腰部作者后续误推 */
+    public void removeActiveFan(Long authorId, Long fanId) {
+        if (authorId == null || fanId == null) return;
+        redis.opsForZSet().remove(String.format(AUTHOR_ACTIVE_FANS_KEY, authorId), String.valueOf(fanId));
+    }
+
     /** 删除笔记时从所有粉丝收件箱中移除 */
     public void removeFromFollowerInboxes(Long authorId, Long noteId, Set<Long> fanIds) {
         if (fanIds == null || fanIds.isEmpty()) return;
@@ -204,11 +245,11 @@ public class RedisNoteRankingService {
         return result;
     }
 
-    // ==================== 拉模式：从大V 发件箱拉取 ====================
+    // ==================== 拉模式：从中腰部/大V 发件箱拉取 ====================
 
     /**
-     * 从多个大V 的 note:mine 中拉取帖子，按时间倒序合并。
-     * 对每个大V 做 ZREVRANGEBYSCORE，收集 (noteId → score)，全局按 score 降序排列。
+     * 从多个中腰部/大V 的 note:mine 中拉取帖子，按时间倒序合并。
+     * 对每个作者做 ZREVRANGEBYSCORE，收集 (noteId → score)，全局按 score 降序排列。
      */
     public Map<Long, Long> pullFromBigVs(Set<Long> bigVIds, Long cursor, int pageSize) {
         Map<Long, Long> allEntries = new LinkedHashMap<>();

@@ -27,7 +27,7 @@ public class UserFollowService {
     private final RedisNoteRankingService noteRankingService;
     private final RabbitTemplate rabbitTemplate;
 
-    @Value("${feed.big-v-threshold:1000}")
+    @Value("${feed.big-v-threshold:10000}")
     private int bigVThreshold;
 
     @Transactional
@@ -49,6 +49,7 @@ public class UserFollowService {
 
         // 同步更新 Redis ZSET（快速路径）
         redisFollowService.addFollow(followerId, userId);
+        noteRankingService.markUserActive(followerId, Collections.singleton(userId));
 
         // 检查是否触发大V 标记
         long newFanCount = redisFollowService.getFansCount(userId);
@@ -56,8 +57,10 @@ public class UserFollowService {
             noteRankingService.markBigV(userId);
         }
 
-        // RabbitMQ 异步通知
-        noteRankingService.backfillInboxForNewFan(followerId, userId);
+        // 普通/中腰部作者同步回填；大V 读时从发件箱拉取，不写入收件箱
+        if (newFanCount < bigVThreshold) {
+            noteRankingService.backfillInboxForNewFan(followerId, userId);
+        }
 
         Map<String, Object> msg = new HashMap<>();
         msg.put("action", "follow");
@@ -74,6 +77,7 @@ public class UserFollowService {
                         .eq(UserFollow::getUserId, userId));
 
         redisFollowService.removeFollow(followerId, userId);
+        noteRankingService.removeActiveFan(userId, followerId);
 
         // 检查是否需要摘除大V 标记
         long newFanCount = redisFollowService.getFansCount(userId);

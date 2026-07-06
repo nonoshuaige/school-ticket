@@ -45,7 +45,9 @@ mybatis-plus:
 
 # Feed 配置
 feed:
-  big-v-threshold: 1000  # 粉丝超过此数视为大V，走拉模式不fanout
+  middle-v-threshold: 1000   # 粉丝达到此数视为中腰部作者，仅向活跃粉丝 fanout
+  big-v-threshold: 10000     # 粉丝达到此数视为大V，走拉模式不 fanout
+  active-days: 7             # 最近 N 天访问 /notes 或关注流视为活跃粉丝
 
 # JWT 配置
 jwt:

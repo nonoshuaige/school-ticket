@@ -5,6 +5,7 @@ import com.schoolticket.user.service.RedisFollowService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -22,6 +23,9 @@ public class RedisSyncListener {
 
     private static final String KEY_LATEST  = "note:latest";
     private static final String KEY_MINE    = "note:mine:%d";
+
+    @Value("${feed.big-v-threshold:10000}")
+    private int bigVThreshold;
 
     /** 创建笔记事件 → 加入 latest + mine ZSET + 推拉结合 fanout */
     @RabbitListener(queues = "#{noteCreateQueue.name}")
@@ -73,10 +77,14 @@ public class RedisSyncListener {
             Long userId       = ((Number) msg.get("userId")).longValue();
             if ("follow".equals(action)) {
                 followService.addFollow(followerId, userId);
-                // 关注时：回填被关注者最近笔记到新粉丝收件箱
-                noteRankingService.backfillInboxForNewFan(followerId, userId);
+                noteRankingService.markUserActive(followerId, Collections.singleton(userId));
+                // 关注普通/中腰部作者时回填收件箱；大V 读时从发件箱拉取
+                if (followService.getFansCount(userId) < bigVThreshold) {
+                    noteRankingService.backfillInboxForNewFan(followerId, userId);
+                }
             } else if ("unfollow".equals(action)) {
                 followService.removeFollow(followerId, userId);
+                noteRankingService.removeActiveFan(userId, followerId);
                 // 取关时：清理该用户笔记
                 noteRankingService.removeAuthorFromInbox(followerId, userId);
             }

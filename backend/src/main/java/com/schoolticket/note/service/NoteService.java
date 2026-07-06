@@ -49,7 +49,10 @@ public class NoteService {
     private static final int FEED_SNAPSHOT_SIZE = 200;
     private static final int FEED_TTL_MINUTES = 30;
 
-    @Value("${feed.big-v-threshold:1000}")
+    @Value("${feed.middle-v-threshold:1000}")
+    private int middleVThreshold;
+
+    @Value("${feed.big-v-threshold:10000}")
     private int bigVThreshold;
 
     // ==================== 推荐流（快照拉取 — Session 级私有 Feed 队列） ====================
@@ -65,6 +68,9 @@ public class NoteService {
 
         // 懒加载：全局候选池过期则从 DB 重建
         noteRankingService.ensureLatestLoaded();
+        if (currentUserId != null) {
+            noteRankingService.markUserActive(currentUserId, redisFollowService.getFollowingIds(currentUserId));
+        }
 
         long tSnap = 0, tPush = 0, tPop = 0, tBloom = 0, tVO = 0;
         if (cursor == null) {
@@ -153,7 +159,7 @@ public class NoteService {
         return result;
     }
 
-    // ==================== 关注流（推拉结合：普通用户推 + 大V 拉） ====================
+    // ==================== 关注流（三段式推拉：普通作者全推 + 中腰部活跃推 + 大V 拉） ====================
 
     public CursorPage<Map<String, Object>> followingFeed(Long currentUserId, Long cursor, int pageSize) {
         if (currentUserId == null) return CursorPage.of(Collections.emptyList(), null, false, 0);
@@ -161,10 +167,14 @@ public class NoteService {
         Set<Long> followingIds = redisFollowService.getFollowingIds(currentUserId);
         if (followingIds.isEmpty()) return CursorPage.of(Collections.emptyList(), null, false, 0);
 
-        // 1. 区分大V 和普通关注者
-        Set<Long> bigVIds = noteRankingService.filterBigVIds(followingIds);
+        noteRankingService.markUserActive(currentUserId, followingIds);
+
+        // 1. 区分全量推作者（<1000粉）和拉取作者（>=1000粉：中腰部 + 大V）
+        Set<Long> pullAuthorIds = followingIds.stream()
+                .filter(authorId -> redisFollowService.getFansCount(authorId) >= middleVThreshold)
+                .collect(Collectors.toSet());
         Set<Long> normalIds = new HashSet<>(followingIds);
-        normalIds.removeAll(bigVIds);
+        normalIds.removeAll(pullAuthorIds);
 
         // 2. 确保收件箱（只含普通用户的推内容）
         if (!normalIds.isEmpty()) {
@@ -186,13 +196,13 @@ public class NoteService {
             }
         }
 
-        // 4. 从大V 发件箱拉取
-        Map<Long, Long> bigVEntries = noteRankingService.pullFromBigVs(bigVIds, cursor, pageSize);
+        // 4. 从中腰部/大V 发件箱拉取。中腰部只推活跃粉丝，读时仍拉取以覆盖回流用户。
+        Map<Long, Long> pullEntries = noteRankingService.pullFromBigVs(pullAuthorIds, cursor, pageSize);
 
         // 5. 合并两个来源的 (noteId → score)，按时间戳降序排列
         Map<Long, Long> allEntries = new LinkedHashMap<>();
         allEntries.putAll(inboxEntries);
-        for (Map.Entry<Long, Long> e : bigVEntries.entrySet()) {
+        for (Map.Entry<Long, Long> e : pullEntries.entrySet()) {
             allEntries.putIfAbsent(e.getKey(), e.getValue());
         }
 
@@ -275,12 +285,15 @@ public class NoteService {
         // 2. 同步写入 latest + mine ZSET
         noteRankingService.addNote(note);
 
-        // 3. 推拉结合：大V 只写 mine 不 fanout，普通用户 fanout
+        // 3. 三段式推拉：普通作者全量推，中腰部只推活跃粉丝，大V 只写 mine 不 fanout
         long timestamp = toEpochMilli(note.getCreateTime());
         long fanCount = redisFollowService.getFansCount(userId);
         Set<Long> fanIds;
-        if (fanCount < bigVThreshold) {
+        if (fanCount < middleVThreshold) {
             fanIds = redisFollowService.getFanIds(userId);
+            noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
+        } else if (fanCount < bigVThreshold) {
+            fanIds = noteRankingService.getActiveFanIds(userId);
             noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
         } else {
             noteRankingService.markBigV(userId);

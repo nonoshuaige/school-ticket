@@ -1,10 +1,10 @@
 # 🎫 校园活动票务系统
 
-> v4.7 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
+> v4.8 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
 
 ## 项目简介
 
-面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。项目从零构建了完整的订单履约闭环与 Feed 流信息流系统。
+面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构。项目从零构建了完整的订单履约闭环与 Feed 流信息流系统。
 
 ## 🎯 核心亮点
 
@@ -154,26 +154,30 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 │  热点延迟: 23-30ms（含 pipeline 批量优化）     │
 └──────────────────────────────────────────────┘
 
-┌─ 关注流（需登录，推拉结合 v3.11）─────────────┐
+┌─ 关注流（需登录，三段式推拉 v4.8）────────────┐
 │                                              │
 │  发布笔记时分支判断:                            │
 │    fanCount < 1000?                           │
-│    ├─ YES → 推模式: fanout 到粉丝收件箱         │
+│    ├─ YES → 推全部粉丝: feed:following:{fanId} │
 │    │    遍历作者粉丝 → feed:following:{fanId}   │
 │    │    ZADD 写入每个粉丝收件箱 → 裁剪至 800     │
 │    │                                          │
-│    └─ NO  → 拉模式: 标记 bigv:ids，不 fanout   │
-│             仅写 note:mine:{authorId}          │
+│    └─ NO → fanCount < 10000?                  │
+│       ├─ YES → 仅推 7 天活跃粉丝                │
+│       │        author:active_fans:{authorId}   │
+│       └─ NO  → 大V: 标记 bigv:ids，不 fanout    │
+│                仅写 note:mine:{authorId}       │
 │       │                                      │
 │       ▼                                      │
 │  读取时合并两源:                                │
 │    ├─ 收件箱 feed:following:{userId}（推内容）  │
-│    ├─ 大V mine note:mine:{bigVId}（拉内容）     │
+│    ├─ 中腰部/大V note:mine:{authorId}（拉内容） │
 │    ├─ 按时间戳 merge → 游标分页                 │
 │       │                                      │
 │       ▼                                      │
 │  VO 缓存批量读 → 响应                          │
 │                                              │
+│  访问 /notes 或 /following-feed → 刷新活跃粉丝  │
 │  新粉关注 → 从 author mine 回填 50 条          │
 │  取关    → ZREM 该作者全部笔记 + 摘除大V 标记   │
 └──────────────────────────────────────────────┘
@@ -214,21 +218,25 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 - 新增 `POST /api/v1/user/follow/check/batch` 批量关注检查接口，替代 Feed 卡片逐条 `checkFollowing`，消除前端 N+1 请求。
 - 批量接口使用 `/check/batch` 多段路径，避免被 `POST /user/follow/{userId}` 误匹配。
 
-**关注流链路（v3.11 推拉结合）：**
+**关注流链路（v4.8 活跃粉丝选择性 fanout）：**
 
 | Redis Key | 类型 | TTL | 用途 |
 |-----------|------|-----|------|
-| `feed:following:{userId}` | ZSET | 3天 | 粉丝收件箱，仅普通用户（<1000粉）发布时 fanout 写入，最多 800 条 |
-| `bigv:ids` | Set | 持久 | 大V 用户 ID 集合，粉丝数 ≥ 阈值时自动加入 |
+| `feed:following:{userId}` | ZSET | 3天 | 粉丝收件箱，普通作者全量写入，中腰部作者仅写入活跃粉丝 |
+| `author:active_fans:{authorId}` | ZSET | 8天 | 作者最近 7 天活跃粉丝集合，score=粉丝最近访问时间 |
+| `user:active:{userId}` | String | 8天 | 用户最近访问 `/notes` 或关注流的时间戳 |
+| `bigv:ids` | Set | 持久 | 大V 用户 ID 集合，粉丝数 ≥ 10000 时自动加入 |
 | `user:follow:{userId}` | ZSET | 3天 | 关注作者列表 |
 | `user:fans:{userId}` | ZSET | 3天 | 粉丝列表（fanout 时查询） |
-| `note:mine:{userId}` | ZSET | 3天 | 作者发布的笔记索引（大V 拉模式 + 新粉回填数据源） |
+| `note:mine:{userId}` | ZSET | 3天 | 作者发布的笔记索引（中腰部/大V 拉模式 + 回填数据源） |
 
 **推拉结合关键机制：**
 
-- **发帖分支**（`feed.big-v-threshold: 1000`）：粉丝 < 1000 → 推，fanout 到粉丝收件箱；粉丝 ≥ 1000 → 拉，仅写 `note:mine` + 标记 `bigv:ids`
-- **读时合并**：收件箱（普通关注者推内容）+ 大V `note:mine` 拉取 → 按时间戳降序合并 → 游标分页
+- **发帖分支**：粉丝 < 1000 → 推给所有粉丝；1000 ≤ 粉丝 < 10000 → 仅推给最近 7 天活跃粉丝；粉丝 ≥ 10000 → 不 fanout，仅写 `note:mine` + 标记 `bigv:ids`
+- **活跃粉丝定义**：最近 7 天访问过 `/notes`（推荐/关注 Tab）或 `/following-feed` 的用户，访问时写入 `user:active:{userId}` 和其关注作者的 `author:active_fans:{authorId}`
+- **读时合并**：收件箱（普通作者全量推 + 中腰部活跃推内容）+ 中腰部/大V `note:mine` 拉取 → 按时间戳降序合并 → 游标分页
 - **关注联动**：关注/取关在主流程同步维护收件箱（关注回填最近 50 条，取关清理该作者笔记）+ RabbitMQ 异步兜底，避免 MQ 未启动时关注关系已生效但关注流缺旧笔记；同时检查是否触发/摘除大V 标记
+- **配置项**：`feed.middle-v-threshold: 1000`、`feed.big-v-threshold: 10000`、`feed.active-days: 7`
 
 **按用户懒加载 + TTL 过期（v3.6）：**
 

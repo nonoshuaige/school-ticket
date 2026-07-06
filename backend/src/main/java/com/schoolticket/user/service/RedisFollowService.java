@@ -63,11 +63,13 @@ public class RedisFollowService {
     }
 
     public long getFollowCount(Long userId) {
+        ensureFollowLoaded(userId);
         Long size = redis.opsForZSet().zCard(String.format(FOLLOW_KEY, userId));
         return size == null ? 0 : size;
     }
 
     public long getFansCount(Long userId) {
+        ensureFansLoaded(userId);
         Long size = redis.opsForZSet().zCard(String.format(FANS_KEY, userId));
         return size == null ? 0 : size;
     }
