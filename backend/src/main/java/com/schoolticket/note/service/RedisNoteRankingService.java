@@ -219,12 +219,31 @@ public class RedisNoteRankingService {
         redis.expire(inboxKey, FOLLOW_FEED_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
-    // ==================== 大V 标记（bigv:ids Set） ====================
+    // ==================== 作者 fanout 等级标记（middlev:ids / bigv:ids Set） ====================
 
+    private static final String MIDDLEV_IDS_KEY = "middlev:ids";
     private static final String BIGV_IDS_KEY = "bigv:ids";
+
+    public enum AuthorFanoutTier {
+        NORMAL, MIDDLE, BIG
+    }
+
+    public void markMiddleV(Long userId) {
+        redis.opsForSet().add(MIDDLEV_IDS_KEY, String.valueOf(userId));
+        redis.opsForSet().remove(BIGV_IDS_KEY, String.valueOf(userId));
+    }
+
+    public void unmarkMiddleV(Long userId) {
+        redis.opsForSet().remove(MIDDLEV_IDS_KEY, String.valueOf(userId));
+    }
+
+    public boolean isMiddleV(Long userId) {
+        return Boolean.TRUE.equals(redis.opsForSet().isMember(MIDDLEV_IDS_KEY, String.valueOf(userId)));
+    }
 
     public void markBigV(Long userId) {
         redis.opsForSet().add(BIGV_IDS_KEY, String.valueOf(userId));
+        redis.opsForSet().remove(MIDDLEV_IDS_KEY, String.valueOf(userId));
     }
 
     public void unmarkBigV(Long userId) {
@@ -233,6 +252,52 @@ public class RedisNoteRankingService {
 
     public boolean isBigV(Long userId) {
         return Boolean.TRUE.equals(redis.opsForSet().isMember(BIGV_IDS_KEY, String.valueOf(userId)));
+    }
+
+    /**
+     * 按进入/退出阈值解析作者 fanout 等级。
+     * 等级有状态记忆：进入用高阈值，退出用低阈值，避免粉丝数在边界反复横跳。
+     */
+    public AuthorFanoutTier resolveAuthorFanoutTier(Long authorId,
+                                                    long fanCount,
+                                                    int middleEnterThreshold,
+                                                    int middleExitThreshold,
+                                                    int bigEnterThreshold,
+                                                    int bigExitThreshold) {
+        if (isBigV(authorId)) {
+            if (fanCount >= bigExitThreshold) {
+                return AuthorFanoutTier.BIG;
+            }
+            unmarkBigV(authorId);
+            if (fanCount >= middleExitThreshold) {
+                markMiddleV(authorId);
+                return AuthorFanoutTier.MIDDLE;
+            }
+            unmarkMiddleV(authorId);
+            return AuthorFanoutTier.NORMAL;
+        }
+
+        if (isMiddleV(authorId)) {
+            if (fanCount >= bigEnterThreshold) {
+                markBigV(authorId);
+                return AuthorFanoutTier.BIG;
+            }
+            if (fanCount >= middleExitThreshold) {
+                return AuthorFanoutTier.MIDDLE;
+            }
+            unmarkMiddleV(authorId);
+            return AuthorFanoutTier.NORMAL;
+        }
+
+        if (fanCount >= bigEnterThreshold) {
+            markBigV(authorId);
+            return AuthorFanoutTier.BIG;
+        }
+        if (fanCount >= middleEnterThreshold) {
+            markMiddleV(authorId);
+            return AuthorFanoutTier.MIDDLE;
+        }
+        return AuthorFanoutTier.NORMAL;
     }
 
     /** 从关注列表中筛出大V ID */

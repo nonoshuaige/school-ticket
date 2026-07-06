@@ -4,7 +4,7 @@
 
 ## 项目简介
 
-面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构。项目从零构建了完整的订单履约闭环与 Feed 流信息流系统。
+面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构，并使用 1000/800、10000/8000 滞回阈值避免等级抖动。项目从零构建了完整的订单履约闭环与 Feed 流信息流系统。
 
 ## 🎯 核心亮点
 
@@ -157,12 +157,12 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 ┌─ 关注流（需登录，三段式推拉 v4.8）────────────┐
 │                                              │
 │  发布笔记时分支判断:                            │
-│    fanCount < 1000?                           │
+│    fanCount < 1000 且未在中腰部缓冲区?          │
 │    ├─ YES → 推全部粉丝: feed:following:{fanId} │
 │    │    遍历作者粉丝 → feed:following:{fanId}   │
 │    │    ZADD 写入每个粉丝收件箱 → 裁剪至 800     │
 │    │                                          │
-│    └─ NO → fanCount < 10000?                  │
+│    └─ NO → 未进入/保留大V?                     │
 │       ├─ YES → 仅推 7 天活跃粉丝                │
 │       │        author:active_fans:{authorId}   │
 │       └─ NO  → 大V: 标记 bigv:ids，不 fanout    │
@@ -225,6 +225,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | `feed:following:{userId}` | ZSET | 3天 | 粉丝收件箱，普通作者全量写入，中腰部作者仅写入活跃粉丝 |
 | `author:active_fans:{authorId}` | ZSET | 8天 | 作者最近 7 天活跃粉丝集合，score=粉丝最近访问时间 |
 | `user:active:{userId}` | String | 8天 | 用户最近访问 `/notes` 或关注流的时间戳 |
+| `middlev:ids` | Set | 持久 | 中腰部作者 ID 集合，使用进入/退出阈值避免 1000 附近抖动 |
 | `bigv:ids` | Set | 持久 | 大V 用户 ID 集合，粉丝数 ≥ 10000 时自动加入 |
 | `user:follow:{userId}` | ZSET | 3天 | 关注作者列表 |
 | `user:fans:{userId}` | ZSET | 3天 | 粉丝列表（fanout 时查询） |
@@ -232,11 +233,12 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 **推拉结合关键机制：**
 
-- **发帖分支**：粉丝 < 1000 → 推给所有粉丝；1000 ≤ 粉丝 < 10000 → 仅推给最近 7 天活跃粉丝；粉丝 ≥ 10000 → 不 fanout，仅写 `note:mine` + 标记 `bigv:ids`
+- **发帖分支**：普通作者 → 推给所有粉丝；中腰部作者 → 仅推给最近 7 天活跃粉丝；大V → 不 fanout，仅写 `note:mine` + 标记 `bigv:ids`
+- **等级滞回**：普通作者粉丝数达到 1000 才进入中腰部，进入后跌破 800 才退回普通；中腰部达到 10000 才进入大V，进入后跌破 8000 才退回中腰部，避免在边界反复切换策略
 - **活跃粉丝定义**：最近 7 天访问过 `/notes`（推荐/关注 Tab）或 `/following-feed` 的用户，访问时写入 `user:active:{userId}` 和其关注作者的 `author:active_fans:{authorId}`
 - **读时合并**：收件箱（普通作者全量推 + 中腰部活跃推内容）+ 中腰部/大V `note:mine` 拉取 → 按时间戳降序合并 → 游标分页
 - **关注联动**：关注/取关在主流程同步维护收件箱（关注回填最近 50 条，取关清理该作者笔记）+ RabbitMQ 异步兜底，避免 MQ 未启动时关注关系已生效但关注流缺旧笔记；同时检查是否触发/摘除大V 标记
-- **配置项**：`feed.middle-v-threshold: 1000`、`feed.big-v-threshold: 10000`、`feed.active-days: 7`
+- **配置项**：`feed.middle-v-enter-threshold: 1000`、`feed.middle-v-exit-threshold: 800`、`feed.big-v-enter-threshold: 10000`、`feed.big-v-exit-threshold: 8000`、`feed.active-days: 7`
 
 **按用户懒加载 + TTL 过期（v3.6）：**
 

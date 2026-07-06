@@ -49,11 +49,17 @@ public class NoteService {
     private static final int FEED_SNAPSHOT_SIZE = 200;
     private static final int FEED_TTL_MINUTES = 30;
 
-    @Value("${feed.middle-v-threshold:1000}")
-    private int middleVThreshold;
+    @Value("${feed.middle-v-enter-threshold:1000}")
+    private int middleVEnterThreshold;
 
-    @Value("${feed.big-v-threshold:10000}")
-    private int bigVThreshold;
+    @Value("${feed.middle-v-exit-threshold:800}")
+    private int middleVExitThreshold;
+
+    @Value("${feed.big-v-enter-threshold:10000}")
+    private int bigVEnterThreshold;
+
+    @Value("${feed.big-v-exit-threshold:8000}")
+    private int bigVExitThreshold;
 
     // ==================== 推荐流（快照拉取 — Session 级私有 Feed 队列） ====================
 
@@ -169,9 +175,9 @@ public class NoteService {
 
         noteRankingService.markUserActive(currentUserId, followingIds);
 
-        // 1. 区分全量推作者（<1000粉）和拉取作者（>=1000粉：中腰部 + 大V）
+        // 1. 按滞回等级区分全量推作者和拉取作者（中腰部 + 大V）
         Set<Long> pullAuthorIds = followingIds.stream()
-                .filter(authorId -> redisFollowService.getFansCount(authorId) >= middleVThreshold)
+                .filter(authorId -> resolveAuthorFanoutTier(authorId) != RedisNoteRankingService.AuthorFanoutTier.NORMAL)
                 .collect(Collectors.toSet());
         Set<Long> normalIds = new HashSet<>(followingIds);
         normalIds.removeAll(pullAuthorIds);
@@ -288,15 +294,15 @@ public class NoteService {
         // 3. 三段式推拉：普通作者全量推，中腰部只推活跃粉丝，大V 只写 mine 不 fanout
         long timestamp = toEpochMilli(note.getCreateTime());
         long fanCount = redisFollowService.getFansCount(userId);
+        RedisNoteRankingService.AuthorFanoutTier tier = resolveAuthorFanoutTier(userId, fanCount);
         Set<Long> fanIds;
-        if (fanCount < middleVThreshold) {
+        if (tier == RedisNoteRankingService.AuthorFanoutTier.NORMAL) {
             fanIds = redisFollowService.getFanIds(userId);
             noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
-        } else if (fanCount < bigVThreshold) {
+        } else if (tier == RedisNoteRankingService.AuthorFanoutTier.MIDDLE) {
             fanIds = noteRankingService.getActiveFanIds(userId);
             noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
         } else {
-            noteRankingService.markBigV(userId);
             fanIds = Collections.emptySet();
         }
 
@@ -305,11 +311,25 @@ public class NoteService {
         msg.put("noteId", note.getNoteId());
         msg.put("userId", userId);
         msg.put("createTime", timestamp);
-        msg.put("bigV", fanCount >= bigVThreshold);
+        msg.put("bigV", tier == RedisNoteRankingService.AuthorFanoutTier.BIG);
         msg.put("fanIds", fanIds.stream().map(String::valueOf).collect(Collectors.toList()));
         rabbitTemplate.convertAndSend("school.ticket.exchange", "note.create", msg);
 
         return note;
+    }
+
+    private RedisNoteRankingService.AuthorFanoutTier resolveAuthorFanoutTier(Long authorId) {
+        return resolveAuthorFanoutTier(authorId, redisFollowService.getFansCount(authorId));
+    }
+
+    private RedisNoteRankingService.AuthorFanoutTier resolveAuthorFanoutTier(Long authorId, long fanCount) {
+        return noteRankingService.resolveAuthorFanoutTier(
+                authorId,
+                fanCount,
+                middleVEnterThreshold,
+                middleVExitThreshold,
+                bigVEnterThreshold,
+                bigVExitThreshold);
     }
 
     @Transactional

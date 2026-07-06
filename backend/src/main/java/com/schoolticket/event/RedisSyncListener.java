@@ -24,8 +24,17 @@ public class RedisSyncListener {
     private static final String KEY_LATEST  = "note:latest";
     private static final String KEY_MINE    = "note:mine:%d";
 
-    @Value("${feed.big-v-threshold:10000}")
-    private int bigVThreshold;
+    @Value("${feed.middle-v-enter-threshold:1000}")
+    private int middleVEnterThreshold;
+
+    @Value("${feed.middle-v-exit-threshold:800}")
+    private int middleVExitThreshold;
+
+    @Value("${feed.big-v-enter-threshold:10000}")
+    private int bigVEnterThreshold;
+
+    @Value("${feed.big-v-exit-threshold:8000}")
+    private int bigVExitThreshold;
 
     /** 创建笔记事件 → 加入 latest + mine ZSET + 推拉结合 fanout */
     @RabbitListener(queues = "#{noteCreateQueue.name}")
@@ -79,12 +88,14 @@ public class RedisSyncListener {
                 followService.addFollow(followerId, userId);
                 noteRankingService.markUserActive(followerId, Collections.singleton(userId));
                 // 关注普通/中腰部作者时回填收件箱；大V 读时从发件箱拉取
-                if (followService.getFansCount(userId) < bigVThreshold) {
+                RedisNoteRankingService.AuthorFanoutTier tier = resolveAuthorFanoutTier(userId, followService.getFansCount(userId));
+                if (tier != RedisNoteRankingService.AuthorFanoutTier.BIG) {
                     noteRankingService.backfillInboxForNewFan(followerId, userId);
                 }
             } else if ("unfollow".equals(action)) {
                 followService.removeFollow(followerId, userId);
                 noteRankingService.removeActiveFan(userId, followerId);
+                resolveAuthorFanoutTier(userId, followService.getFansCount(userId));
                 // 取关时：清理该用户笔记
                 noteRankingService.removeAuthorFromInbox(followerId, userId);
             }
@@ -92,5 +103,15 @@ public class RedisSyncListener {
         } catch (Exception e) {
             log.error("handleFollow error", e);
         }
+    }
+
+    private RedisNoteRankingService.AuthorFanoutTier resolveAuthorFanoutTier(Long userId, long fanCount) {
+        return noteRankingService.resolveAuthorFanoutTier(
+                userId,
+                fanCount,
+                middleVEnterThreshold,
+                middleVExitThreshold,
+                bigVEnterThreshold,
+                bigVExitThreshold);
     }
 }

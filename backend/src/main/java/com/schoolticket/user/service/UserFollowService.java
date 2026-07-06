@@ -27,8 +27,17 @@ public class UserFollowService {
     private final RedisNoteRankingService noteRankingService;
     private final RabbitTemplate rabbitTemplate;
 
-    @Value("${feed.big-v-threshold:10000}")
-    private int bigVThreshold;
+    @Value("${feed.middle-v-enter-threshold:1000}")
+    private int middleVEnterThreshold;
+
+    @Value("${feed.middle-v-exit-threshold:800}")
+    private int middleVExitThreshold;
+
+    @Value("${feed.big-v-enter-threshold:10000}")
+    private int bigVEnterThreshold;
+
+    @Value("${feed.big-v-exit-threshold:8000}")
+    private int bigVExitThreshold;
 
     @Transactional
     public void follow(Long followerId, Long userId) {
@@ -51,14 +60,11 @@ public class UserFollowService {
         redisFollowService.addFollow(followerId, userId);
         noteRankingService.markUserActive(followerId, Collections.singleton(userId));
 
-        // 检查是否触发大V 标记
         long newFanCount = redisFollowService.getFansCount(userId);
-        if (newFanCount >= bigVThreshold) {
-            noteRankingService.markBigV(userId);
-        }
+        RedisNoteRankingService.AuthorFanoutTier tier = resolveAuthorFanoutTier(userId, newFanCount);
 
         // 普通/中腰部作者同步回填；大V 读时从发件箱拉取，不写入收件箱
-        if (newFanCount < bigVThreshold) {
+        if (tier != RedisNoteRankingService.AuthorFanoutTier.BIG) {
             noteRankingService.backfillInboxForNewFan(followerId, userId);
         }
 
@@ -79,11 +85,8 @@ public class UserFollowService {
         redisFollowService.removeFollow(followerId, userId);
         noteRankingService.removeActiveFan(userId, followerId);
 
-        // 检查是否需要摘除大V 标记
         long newFanCount = redisFollowService.getFansCount(userId);
-        if (newFanCount < bigVThreshold) {
-            noteRankingService.unmarkBigV(userId);
-        }
+        resolveAuthorFanoutTier(userId, newFanCount);
 
         noteRankingService.removeAuthorFromInbox(followerId, userId);
 
@@ -191,5 +194,15 @@ public class UserFollowService {
     public void syncFollowToRedis(Long userId) {
         redisFollowService.ensureFollowLoaded(userId);
         redisFollowService.ensureFansLoaded(userId);
+    }
+
+    private RedisNoteRankingService.AuthorFanoutTier resolveAuthorFanoutTier(Long userId, long fanCount) {
+        return noteRankingService.resolveAuthorFanoutTier(
+                userId,
+                fanCount,
+                middleVEnterThreshold,
+                middleVExitThreshold,
+                bigVEnterThreshold,
+                bigVExitThreshold);
     }
 }
