@@ -1,10 +1,10 @@
 # 🎫 校园活动票务系统
 
-> v4.8 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**与**种草笔记**三大核心场景。
+> v4.9 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**、**热门互动链路**与**种草笔记**四大核心场景。
 
 ## 项目简介
 
-面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构，并使用 1000/800、10000/8000 滞回阈值避免等级抖动。项目从零构建了完整的订单履约闭环与 Feed 流信息流系统。
+面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构，并使用 1000/800、10000/8000 滞回阈值避免等级抖动。v4.9 补强热门互动链路：点赞 Redis 幂等先行 + RabbitMQ 异步落库 + 延迟校准，评论前 3 页 Redis 热缓存 + 评论数计数器，适配热门内容高并发读写。项目从零构建了完整的订单履约闭环、Feed 流信息流系统与互动高并发链路。
 
 ## 🎯 核心亮点
 
@@ -194,6 +194,10 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | `note:vo:{noteId}` | Hash | 7天 | 笔记全量 VO 缓存（按需写入） |
 | `note:like:count:{noteId}` | String | 7天 | Redis 先行点赞计数器 |
 | `user:likes:{userId}` | Set | 3天 | 用户点赞集合，O(1) SISMEMBER 判赞 |
+| `note:like:dirty` | ZSET | 7天 | 待延迟校准的点赞计数 noteId，score=最近变更时间 |
+| `note:comment:count:{noteId}` | String | 7天 | Redis 评论数计数器 |
+| `note:comments:page:{noteId}:{page}:{pageSize}` | String(JSON) | 5分钟 | 评论热区前 3 页缓存 |
+| `note:comments:keys:{noteId}` | Set | 5分钟 | 评论页缓存索引，写/删评论时批量失效 |
 
 **Pipeline 批量优化（v3.5）：**
 
@@ -246,7 +250,55 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 
 ---
 
-### 三、种草笔记系统 — 笔记关联活动 + 种草徽章 + 活动卡片跳转（v4.0）
+### 三、热门互动链路 — 点赞异步落库 + 评论热区缓存（v4.9）
+
+```
+┌─ 点赞链路（Redis 先行，MQ 落库）───────────────┐
+│                                                │
+│  POST /note/{id}/like                           │
+│    ├─ ensure user:likes:{userId} 懒加载          │
+│    ├─ SADD user:likes:{userId} noteId            │
+│    │    └─ 返回 0 → 重复点赞，直接幂等返回        │
+│    ├─ ensure note:like:count:{noteId} 懒加载     │
+│    ├─ INCR note:like:count:{noteId}              │
+│    ├─ HINCRBY note:vo:{noteId}.likeCount         │
+│    ├─ ZADD note:like:dirty noteId                │
+│    └─ publish note.like.queue                    │
+│          └─ RedisSyncListener 异步 INSERT/DELETE │
+│                                                │
+│  NoteLikeReconcileTask 每 60s 扫描 dirty，        │
+│  对 30s 前变更的 noteId 从 MySQL 聚合后校准 Redis │
+└────────────────────────────────────────────────┘
+
+┌─ 评论链路（MySQL 持久化，Redis 缓存热区）──────┐
+│                                                │
+│  POST /note/{id}/comment                        │
+│    ├─ MySQL INSERT user_note_comment             │
+│    ├─ INCR note:comment:count:{noteId}           │
+│    └─ 删除 note:comments:keys:{noteId} 下的热页缓存│
+│                                                │
+│  GET /note/{id}/comment?page=1&pageSize=20       │
+│    ├─ 前 3 页且 pageSize<=20 → 优先读 Redis       │
+│    ├─ miss → MySQL 一级分页 + 子评论批量查询       │
+│    └─ 写入 note:comments:page:{noteId}:{page}:{size}│
+│                                                │
+│  GET /note/{id}/comment/count                    │
+│    └─ Redis miss → MySQL COUNT 回填              │
+└────────────────────────────────────────────────┘
+```
+
+| 场景 | 方案 | 效果 |
+|------|------|------|
+| 重复点赞 | `SADD user:likes:{userId}` 返回值做幂等，只有新增成功才 `INCR` | 防止连点导致计数漂移 |
+| 点赞落库压力 | RabbitMQ `note.like.queue` 异步写 `note_like`，唯一键兜底 | 热门内容点赞请求不阻塞 DB |
+| 计数一致性 | `note:like:dirty` + `NoteLikeReconcileTask` 延迟校准 | Redis 快速展示，MySQL 最终一致 |
+| Redis 计数序列化 | 点赞数/评论数使用裸字节读写 | 避免 JSON 序列化值导致 `INCR` 报错 |
+| 评论热点读 | 评论前 3 页缓存 5 分钟，写/删评论按 noteId 批量失效 | 热门详情页不反复打 MySQL |
+| 评论数展示 | `note:comment:count:{noteId}` Redis 计数器，miss 回源 | 列表/详情可快速展示评论数 |
+
+---
+
+### 四、种草笔记系统 — 笔记关联活动 + 种草徽章 + 活动卡片跳转（v4.0）
 
 ```
 ┌─ 种草笔记链路 ─────────────────────────────────┐
@@ -390,8 +442,12 @@ npm run dev
 | GET | /api/v1/note/following-feed?cursor=&pageSize= | **关注流（推拉结合，需登录）** |
 | GET | /api/v1/note/my-notes?cursor=&pageSize= | 我的笔记 |
 | POST | /api/v1/note/create | 发布笔记（支持 eventIds 关联活动种草） |
-| POST | /api/v1/note/{id}/like | 点赞 |
-| GET | /api/v1/note/{id}/comment | 评论列表（二级展平） |
+| POST | /api/v1/note/{id}/like | 点赞（Redis 幂等先行 + MQ 异步落库） |
+| DELETE | /api/v1/note/{id}/like | 取消点赞（Redis 幂等先行 + MQ 异步落库） |
+| POST | /api/v1/note/{id}/comment | 发表评论（MySQL 持久化 + 评论缓存失效） |
+| GET | /api/v1/note/{id}/comment | 评论列表（二级展平，前 3 页 Redis 热缓存） |
+| GET | /api/v1/note/{id}/comment/count | 评论数（Redis 计数器，miss 回源） |
+| DELETE | /api/v1/note/{id}/comment/{commentId} | 删除评论（仅作者可删，评论缓存失效） |
 | POST | /api/v1/user/follow/{id} | 关注用户（同步回填收件箱 + MQ 兜底） |
 | DELETE | /api/v1/user/follow/{id} | 取消关注（同步清理收件箱 + MQ 兜底） |
 | POST | /api/v1/user/follow/check/batch | 批量检查当前用户是否关注作者（Feed 卡片用） |
@@ -427,9 +483,10 @@ npm run dev
 │           ├── note/
 │           │   ├── controller/NoteController.java
 │           │   ├── service/NoteService.java        # Feed 流业务编排
-│           │   ├── service/RedisNoteRankingService.java # ZSET 排行 + fanout
+│           │   ├── service/RedisNoteRankingService.java # ZSET 排行 + fanout + 点赞计数器
 │           │   ├── service/BloomFilterService.java # Bitmap 布隆过滤器
-│           │   └── service/NoteCommentService.java # 二级展平评论
+│           │   ├── service/NoteCommentService.java # 二级展平评论 + 热区缓存
+│           │   └── task/NoteLikeReconcileTask.java # 点赞计数延迟校准
 │           └── dto/                        # CursorPage, OrderVO, CommentVO 等
 │
 ├── frontend/                               # Vue 3 前端

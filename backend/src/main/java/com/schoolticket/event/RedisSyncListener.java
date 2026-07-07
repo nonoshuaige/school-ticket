@@ -1,11 +1,15 @@
 package com.schoolticket.event;
 
 import com.schoolticket.note.service.RedisNoteRankingService;
+import com.schoolticket.note.entity.NoteLike;
+import com.schoolticket.note.mapper.NoteLikeMapper;
 import com.schoolticket.user.service.RedisFollowService;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
@@ -20,9 +24,38 @@ public class RedisSyncListener {
     private final RedisNoteRankingService noteRankingService;
     private final RedisFollowService followService;
     private final StringRedisTemplate redis;
+    private final NoteLikeMapper noteLikeMapper;
 
     private static final String KEY_LATEST  = "note:latest";
     private static final String KEY_MINE    = "note:mine:%d";
+
+    /** 点赞事件 → 异步落库，Redis 已经先行返回给用户 */
+    @RabbitListener(queues = "#{noteLikeQueue.name}")
+    public void handleNoteLike(Map<String, Object> msg) {
+        try {
+            String action = (String) msg.get("action");
+            Long noteId = ((Number) msg.get("noteId")).longValue();
+            Long userId = ((Number) msg.get("userId")).longValue();
+            if ("like".equals(action)) {
+                NoteLike like = new NoteLike();
+                like.setNoteId(noteId);
+                like.setUserId(userId);
+                try {
+                    noteLikeMapper.insert(like);
+                } catch (DuplicateKeyException ignored) {
+                    // 幂等：重复投递或并发点赞时，唯一键保证只落一条。
+                }
+            } else if ("unlike".equals(action)) {
+                noteLikeMapper.delete(new LambdaQueryWrapper<NoteLike>()
+                        .eq(NoteLike::getNoteId, noteId)
+                        .eq(NoteLike::getUserId, userId));
+            }
+            log.info("Note like synced: action={} noteId={} userId={}", action, noteId, userId);
+        } catch (Exception e) {
+            log.error("handleNoteLike error", e);
+            throw new RuntimeException(e);
+        }
+    }
 
     @Value("${feed.middle-v-enter-threshold:1000}")
     private int middleVEnterThreshold;

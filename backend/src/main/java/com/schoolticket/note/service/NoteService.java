@@ -2,6 +2,7 @@ package com.schoolticket.note.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.schoolticket.common.BusinessException;
+import com.schoolticket.config.RabbitMQConfig;
 import com.schoolticket.dto.CursorPage;
 import com.schoolticket.event.service.EventService;
 import com.schoolticket.note.entity.Note;
@@ -18,7 +19,6 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
-import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -412,41 +412,44 @@ public class NoteService {
 
     // ==================== 点赞/取消（Redis 先行） ====================
 
-    @Transactional
     public void like(Long noteId, Long userId) {
-        // 1. Redis 先行
-        long newCount = noteRankingService.incrLikeCount(noteId);
-        noteRankingService.saddUserLike(userId, noteId);
-        noteRankingService.updateVOLikeCount(noteId, 1);
-
-        // 2. MySQL 落库（唯一约束防并发重复）
-        try {
-            NoteLike nl = new NoteLike();
-            nl.setNoteId(noteId);
-            nl.setUserId(userId);
-            noteLikeMapper.insert(nl);
-        } catch (DuplicateKeyException e) {
-            // 幂等：已点过赞，不回滚 Redis
+        noteRankingService.ensureUserLikesLoaded(userId);
+        boolean changed = noteRankingService.addUserLikeIfAbsent(userId, noteId);
+        if (!changed) {
+            return;
         }
+
+        noteRankingService.ensureLikeCountLoaded(noteId);
+        noteRankingService.incrLikeCount(noteId);
+        noteRankingService.updateVOLikeCount(noteId, 1);
+        noteRankingService.markLikeDirty(noteId);
+
+        Map<String, Object> msg = new HashMap<>();
+        msg.put("action", "like");
+        msg.put("noteId", noteId);
+        msg.put("userId", userId);
+        msg.put("time", System.currentTimeMillis());
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.RK_NOTE_LIKE, msg);
     }
 
-    @Transactional
     public void unlike(Long noteId, Long userId) {
-        // 1. Redis 先行
+        noteRankingService.ensureUserLikesLoaded(userId);
+        boolean changed = noteRankingService.removeUserLikeIfPresent(userId, noteId);
+        if (!changed) {
+            return;
+        }
+
+        noteRankingService.ensureLikeCountLoaded(noteId);
         noteRankingService.decrLikeCount(noteId);
-        noteRankingService.sremUserLike(userId, noteId);
         noteRankingService.updateVOLikeCount(noteId, -1);
+        noteRankingService.markLikeDirty(noteId);
 
-        // 2. MySQL 删除
-        noteLikeMapper.delete(
-                new LambdaQueryWrapper<NoteLike>()
-                        .eq(NoteLike::getNoteId, noteId)
-                        .eq(NoteLike::getUserId, userId));
-
-        // 3. 用 MySQL 实际值校准 Redis（防止计数漂移）
-        long actualCount = noteLikeMapper.selectCount(
-                new LambdaQueryWrapper<NoteLike>().eq(NoteLike::getNoteId, noteId));
-        noteRankingService.setLikeCount(noteId, actualCount);
+        Map<String, Object> msg = new HashMap<>();
+        msg.put("action", "unlike");
+        msg.put("noteId", noteId);
+        msg.put("userId", userId);
+        msg.put("time", System.currentTimeMillis());
+        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.RK_NOTE_LIKE, msg);
     }
 
     // ==================== 冷启动 ====================

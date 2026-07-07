@@ -9,6 +9,7 @@ import com.schoolticket.user.entity.User;
 import com.schoolticket.user.mapper.UserMapper;
 import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
+import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 
@@ -35,6 +36,7 @@ public class RedisNoteRankingService {
     private static final String AUTHOR_ACTIVE_FANS_KEY = "author:active_fans:%d";
     private static final String VO_KEY       = "note:vo:%d";
     private static final String LIKE_COUNT_KEY = "note:like:count:%d";
+    private static final String LIKE_DIRTY_KEY = "note:like:dirty";
     private static final String USER_LIKES_KEY = "user:likes:%d";
     private static final int    FEED_FOLLOWING_CAP = 800;
     private static final long   VO_TTL_SECONDS = 7 * 24 * 3600;
@@ -418,41 +420,64 @@ public class RedisNoteRankingService {
 
     public long incrLikeCount(Long noteId) {
         String key = String.format(LIKE_COUNT_KEY, noteId);
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         try {
-            Long val = redis.opsForValue().increment(key, 1);
-            redis.expire(key, LIKE_COUNT_TTL_SECONDS, TimeUnit.SECONDS);
-            return val;
+            Long val = redis.execute((RedisCallback<Long>) connection -> {
+                Long incremented = connection.stringCommands().incr(keyBytes);
+                connection.keyCommands().expire(keyBytes, LIKE_COUNT_TTL_SECONDS);
+                return incremented;
+            });
+            return val == null ? 0 : val;
         } catch (Exception e) {
-            redis.delete(key);
-            redis.opsForValue().set(key, "1");
-            redis.expire(key, LIKE_COUNT_TTL_SECONDS, TimeUnit.SECONDS);
+            setLikeCount(noteId, 1L);
             return 1L;
         }
     }
 
     public long decrLikeCount(Long noteId) {
         String key = String.format(LIKE_COUNT_KEY, noteId);
+        byte[] keyBytes = key.getBytes(StandardCharsets.UTF_8);
         try {
-            Long val = redis.opsForValue().decrement(key);
-            redis.expire(key, LIKE_COUNT_TTL_SECONDS, TimeUnit.SECONDS);
+            Long val = redis.execute((RedisCallback<Long>) connection -> {
+                Long decremented = connection.stringCommands().decr(keyBytes);
+                connection.keyCommands().expire(keyBytes, LIKE_COUNT_TTL_SECONDS);
+                return decremented;
+            });
             return val == null ? 0 : val;
         } catch (Exception e) {
-            redis.delete(key);
-            redis.opsForValue().set(key, "0");
-            redis.expire(key, LIKE_COUNT_TTL_SECONDS, TimeUnit.SECONDS);
+            setLikeCount(noteId, 0L);
             return 0L;
         }
     }
 
     public long getLikeCount(Long noteId) {
-        String val = redis.opsForValue().get(String.format(LIKE_COUNT_KEY, noteId));
-        return val == null ? -1 : Long.parseLong(val);
+        byte[] keyBytes = String.format(LIKE_COUNT_KEY, noteId).getBytes(StandardCharsets.UTF_8);
+        byte[] raw = redis.execute((RedisCallback<byte[]>) connection -> connection.stringCommands().get(keyBytes));
+        if (raw == null) return -1;
+        String val = new String(raw, StandardCharsets.UTF_8);
+        if (val.length() >= 2 && val.startsWith("\"") && val.endsWith("\"")) {
+            val = val.substring(1, val.length() - 1);
+        }
+        return Long.parseLong(val);
     }
 
     public void setLikeCount(Long noteId, long count) {
+        byte[] keyBytes = String.format(LIKE_COUNT_KEY, noteId).getBytes(StandardCharsets.UTF_8);
+        byte[] valueBytes = String.valueOf(count).getBytes(StandardCharsets.UTF_8);
+        redis.execute((RedisCallback<Void>) connection -> {
+            connection.stringCommands().set(keyBytes, valueBytes);
+            connection.keyCommands().expire(keyBytes, LIKE_COUNT_TTL_SECONDS);
+            return null;
+        });
+    }
+
+    public void ensureLikeCountLoaded(Long noteId) {
         String key = String.format(LIKE_COUNT_KEY, noteId);
-        redis.opsForValue().set(key, String.valueOf(count));
-        redis.expire(key, LIKE_COUNT_TTL_SECONDS, TimeUnit.SECONDS);
+        if (Boolean.TRUE.equals(redis.hasKey(key))) return;
+        long actualCount = noteLikeMapper.selectCount(
+                new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<NoteLike>()
+                        .eq(NoteLike::getNoteId, noteId));
+        setLikeCount(noteId, actualCount);
     }
 
     // ==================== 用户点赞 Set（user:likes:{userId}） ====================
@@ -463,10 +488,37 @@ public class RedisNoteRankingService {
         redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
+    public boolean addUserLikeIfAbsent(Long userId, Long noteId) {
+        String key = String.format(USER_LIKES_KEY, userId);
+        Long added = redis.opsForSet().add(key, String.valueOf(noteId));
+        redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+        return added != null && added > 0;
+    }
+
     public void sremUserLike(Long userId, Long noteId) {
         String key = String.format(USER_LIKES_KEY, userId);
         redis.opsForSet().remove(key, String.valueOf(noteId));
         redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    public boolean removeUserLikeIfPresent(Long userId, Long noteId) {
+        String key = String.format(USER_LIKES_KEY, userId);
+        Long removed = redis.opsForSet().remove(key, String.valueOf(noteId));
+        redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+        return removed != null && removed > 0;
+    }
+
+    public void markLikeDirty(Long noteId) {
+        redis.opsForZSet().add(LIKE_DIRTY_KEY, String.valueOf(noteId), System.currentTimeMillis());
+        redis.expire(LIKE_DIRTY_KEY, LIKE_COUNT_TTL_SECONDS, TimeUnit.SECONDS);
+    }
+
+    public Set<Long> pollDueLikeDirtyIds(long delayMillis, int limit) {
+        long maxScore = System.currentTimeMillis() - delayMillis;
+        Set<String> raw = redis.opsForZSet().rangeByScore(LIKE_DIRTY_KEY, 0, maxScore, 0, limit);
+        if (raw == null || raw.isEmpty()) return Collections.emptySet();
+        redis.opsForZSet().remove(LIKE_DIRTY_KEY, raw.toArray());
+        return raw.stream().map(Long::valueOf).collect(Collectors.toSet());
     }
 
     public boolean isLiked(Long userId, Long noteId) {
