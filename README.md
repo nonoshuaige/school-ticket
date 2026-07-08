@@ -426,6 +426,42 @@ npm run dev
 
 ---
 
+## 🧪 抢购链路测试
+
+仓库提供可执行测试方案与 Node 压测脚本：
+
+- `tests/seckill/抢购链路测试方案.md`
+- `tests/seckill/load-test.mjs`
+
+运行示例：
+
+```powershell
+cd D:\MyProjrct
+$env:TICKET_ID="1"
+$env:QUANTITY="1"
+$env:USER_COUNT="100"
+$env:REQUESTS="100"
+$env:CONCURRENCY="100"
+node .\tests\seckill\load-test.mjs
+```
+
+最近一次本地非支付链路验收结果（支付、退款、支付网关回调不在本轮范围）：
+
+| 测试项 | 结果 |
+|------|------|
+| 高并发同票档抢购 | 300 请求中 53 单成功，247 次被单飞锁快速失败保护 |
+| 零超卖 | `ticket_id=1` 库存 200，最终 MySQL 200 单、remaining=0、Redis stock=0 |
+| 售罄过滤 | 售罄后 100 并发请求新增成功 0 |
+| 活动级跨票档限购 | 用户 1 在活动 1 累计到 5 张后，第 6 张被拒 |
+| RabbitMQ 短暂不可用 | 停 MQ 后 10 单进入 Stream PEL，恢复后 PEL 清零并落库 10 单 |
+| 重复消息幂等 | 手动复投同一 orderId，订单数和 MySQL 库存不重复变化 |
+| 主动取消回滚 | 订单状态变为 2，`order_event_log.status=1`，MySQL/Redis 库存同步回补 |
+| Redis 回滚故障补偿 | Redis 停机取消仍成功写 MySQL 与消息表，恢复后补偿成功 |
+
+当前观察：`SoldOutCache` 的同票档 `tryLock` 快速失败策略能有效保护后端，但在未售罄高并发窗口也会显著压低成功吞吐；后续可考虑仅在售罄回查竞争时快速失败，或引入极短等待/二次读缓存策略。
+
+---
+
 ## 📡 API 一览
 
 | 方法 | 端点 | 说明 |
@@ -497,6 +533,11 @@ npm run dev
 │       │   └── NoteDetail.vue              # 笔记详情 + 二级评论
 │       ├── api/                            # auth / event / order / note / user
 │       └── stores/                         # Pinia: user / order
+│
+├── tests/
+│   └── seckill/
+│       ├── load-test.mjs                   # 抢购链路压测脚本（Node 20 原生 fetch）
+│       └── 抢购链路测试方案.md              # 可执行测试方案 + 对账 SQL/Redis 命令
 │
 └── 开发文档.md                              # 完整开发说明书
 ```
