@@ -1,0 +1,51 @@
+﻿
+=== Limit step 1: ticket=21, qty=2 ===
+mode: limit
+baseUrl: http://localhost:8080/api/v1
+ticketId: 21, quantity: 1
+users: 100, requests: 1, concurrency: 50
+durationMs: 83
+throughputRps: 11.98
+successOrders: 1
+uniqueSuccessOrders: 1
+latencyMs p50=83.46 p95=83.46 p99=83.46 max=83.46
+
+HTTP status:
+  200: 1
+
+Business result:
+  200 success: 1
+
+=== Limit step 2: ticket=22, qty=3 ===
+mode: limit
+baseUrl: http://localhost:8080/api/v1
+ticketId: 21, quantity: 1
+users: 100, requests: 1, concurrency: 50
+durationMs: 23
+throughputRps: 43.98
+successOrders: 1
+uniqueSuccessOrders: 1
+latencyMs p50=22.71 p95=22.71 p99=22.71 max=22.71
+
+HTTP status:
+  200: 1
+
+Business result:
+  200 success: 1
+
+=== Limit step 3: ticket=23, qty=1 ===
+mode: limit
+baseUrl: http://localhost:8080/api/v1
+ticketId: 21, quantity: 1
+users: 100, requests: 1, concurrency: 50
+durationMs: 21
+throughputRps: 48.61
+successOrders: 0
+uniqueSuccessOrders: 0
+latencyMs p50=20.55 p95=20.55 p99=20.55 max=20.55
+
+HTTP status:
+  200: 1
+
+Business result:
+  400 该活动累计最多购买5张，已购5张: 1

@@ -1,0 +1,58 @@
+﻿
+--- soldout round 1/5 ---
+
+=== Seckill 21 ===
+mode: soldout
+baseUrl: http://localhost:8080/api/v1
+ticketId: 21, quantity: 1
+users: 100, requests: 100, concurrency: 100
+durationMs: 488
+throughputRps: 204.91
+successOrders: 99
+uniqueSuccessOrders: 99
+latencyMs p50=414.38 p95=468.12 p99=471.69 max=471.78
+
+HTTP status:
+  200: 100
+
+Business result:
+  200 success: 99
+  400 该活动累计最多购买5张，已购5张: 1
+
+--- soldout round 2/5 ---
+
+=== Seckill 21 ===
+mode: soldout
+baseUrl: http://localhost:8080/api/v1
+ticketId: 21, quantity: 1
+users: 100, requests: 100, concurrency: 100
+durationMs: 349
+throughputRps: 286.18
+successOrders: 0
+uniqueSuccessOrders: 0
+latencyMs p50=293.97 p95=337.35 p99=338.86 max=339.74
+
+HTTP status:
+  200: 100
+
+Business result:
+  4001 该票档已售罄: 100
+
+Total successful orders before post-soldout probe: 99
+
+=== Seckill 21 ===
+mode: soldout
+baseUrl: http://localhost:8080/api/v1
+ticketId: 21, quantity: 1
+users: 100, requests: 100, concurrency: 100
+durationMs: 45
+throughputRps: 2240.26
+successOrders: 0
+uniqueSuccessOrders: 0
+latencyMs p50=28.04 p95=36.22 p99=36.6 max=36.94
+
+HTTP status:
+  200: 100
+
+Business result:
+  400 操作太频繁，请稍后再试: 100

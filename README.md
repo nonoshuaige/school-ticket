@@ -1,10 +1,10 @@
 # 🎫 校园活动票务系统
 
-> v4.9 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**、**热门互动链路**与**种草笔记**四大核心场景。
+> v5.0 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**、**热门互动链路**与**种草笔记**四大核心场景。
 
 ## 项目简介
 
-面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构，并使用 1000/800、10000/8000 滞回阈值避免等级抖动。v4.9 补强热门互动链路：点赞 Redis 幂等先行 + RabbitMQ 异步落库 + 延迟校准，评论前 3 页 Redis 热缓存 + 评论数计数器，适配热门内容高并发读写。项目从零构建了完整的订单履约闭环、Feed 流信息流系统与互动高并发链路。
+面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构，并使用 1000/800、10000/8000 滞回阈值避免等级抖动。v4.9 补强热门互动链路：点赞 Redis 幂等先行 + RabbitMQ 异步落库 + 延迟校准，评论前 3 页 Redis 热缓存 + 评论数计数器，适配热门内容高并发读写。v5.0 修复抢购售罄单飞锁策略，竞争失败短暂复查后温和放行，并补齐非支付链路 reset / mode / verify 自动化测试闭环。项目从零构建了完整的订单履约闭环、Feed 流信息流系统与互动高并发链路。
 
 ## 🎯 核心亮点
 
@@ -17,7 +17,7 @@
   │
   ├─ 1. Caffeine 本地售罄短路 + 单飞锁（5s TTL）
   │      ├─ 命中 → 返回"已售罄"
-  │      └─ 未命中 → tryLock 单线程查 Redis soldout 标记；锁竞争失败 → 快速返回"请求火爆"
+  │      └─ 未命中 → tryLock 单线程查 Redis soldout；锁竞争失败 → sleep 5ms 复查本地缓存，未售罄则放行
   │
   ├─ 2. Redis 售罄预检（Java 侧 GET soldout，比 Lua 更快失败）
   │
@@ -92,7 +92,7 @@
 | Java 侧预检快速失败 | 售罄→库存→限购 三层 Redis 读（概率递减），无效请求不进 Lua（v4.5） | 减少无效 Lua 调用 |
 | Lua 脚本原子性 | 安全校验 + DECRBY + HINCRBY + SET 订单缓存 + XADD stream 全部在 Lua 内完成（v4.5） | 订单写入无间隙，状态一致 |
 | 订单排队状态 | Lua 写 status=-1（排队中）→ Consumer 落库刷 status=0（待支付）→ 前端区分展示（v4.5） | 查询全程走 Redis，零 DB 穿透 |
-| Caffeine 击穿 | 单飞锁：per-ticketId tryLock，抢到锁才回查 Redis，锁竞争失败快速返回（v4.6） | 同类票档同一时刻仅一次 Redis 查询，不放大线程等待 |
+| Caffeine 击穿 | 单飞锁：per-ticketId tryLock，抢到锁才回查 Redis soldout；锁竞争失败短暂复查本地缓存，未确认售罄则放行进入后续预检/Lua（v5.0） | 保留售罄短路，避免未售罄高并发被误杀 |
 | Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，同时投递成单队列与延时关单队列（v4.6） | 磁盘级可靠，消息不因 Redis 重启丢失 |
 | MQ 投递确认窗口 | RabbitMQ `publisher-confirm-type=correlated`，成单与延时两条消息均 confirm ack 后才 XACK Redis Stream（v4.7） | 避免 publish 未被 broker 确认时提前 ack Stream |
 | MySQL 库存口径 | OrderCreateConsumer 插入订单与 `remaining_quantity -= qty` 同事务；取消/退款/超时使用原子 `remaining_quantity += qty`（v4.7） | Redis 热库存与 MySQL 最终库存对称一致 |
@@ -104,7 +104,7 @@
 | 退款异步解耦 | 退款申请写 `refund` 表（refund_id=order_no,status=0）→ RefundTask CAS 抢占 `0→9` → 写 event_log 驱动 Redis 回滚 | 退款请求快速返回，重复消费幂等跳过 |
 | Caffeine 失效时机 | 不主动 invalidate，依赖 5s TTL 自然过期 + OrderEventLogTask 清除 Redis soldout 标记后缓存冷却 | 避免假售罄循环 |
 
-**Caffeine 本地售罄缓存（v4.6 单飞锁快速失败）：**
+**Caffeine 本地售罄缓存（v5.0 单飞锁温和放行）：**
 
 ```java
 Cache<Long, Boolean> cache = Caffeine.newBuilder()
@@ -113,7 +113,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
     .build();
 // 仅缓存 soldOut=true，未命中 = 未售罄
 // checkSoldOut(): Caffeine 命中 → 直接返回；未命中 → tryLock 单线程查 Redis
-// tryLock 失败 → 直接快速返回"请求过于火爆"，不自旋等待、不进入 Lua
+// tryLock 失败 → sleep 5ms 后复查 Caffeine；未确认售罄则进入后续 Redis 预检/Lua
 // 取消/退款不再主动 invalidate，依赖 TTL 自然过期
 // 假售罄修复：Redis soldout 标记由 OrderEventLogTask 清除，缓存过期后下次查询正确状态
 ```
@@ -431,34 +431,32 @@ npm run dev
 仓库提供可执行测试方案与 Node 压测脚本：
 
 - `tests/seckill/抢购链路测试方案.md`
-- `tests/seckill/load-test.mjs`
+- `tests/seckill/load-test.mjs`：支持 `--mode load|limit|soldout|mq-failover|cancel-rollback`
+- `tests/seckill/verify.mjs`：自动检查 MySQL / Redis / RabbitMQ 并输出 PASS / FAIL
+- `tests/seckill/reset-test-env.ps1`：重建测试库、清 Redis、清 MQ、重启后端
+- `tests/seckill/results/20260709-215810/summary.md`：最近一次完整测试结果
 
 运行示例：
 
 ```powershell
 cd D:\MyProjrct
-$env:TICKET_ID="1"
-$env:QUANTITY="1"
-$env:USER_COUNT="100"
-$env:REQUESTS="100"
-$env:CONCURRENCY="100"
-node .\tests\seckill\load-test.mjs
+powershell -ExecutionPolicy Bypass -File .\tests\seckill\reset-test-env.ps1
+node .\tests\seckill\load-test.mjs --mode load --ticket-id 21 --quantity 1 --user-count 100 --requests 100 --concurrency 100
+node .\tests\seckill\verify.mjs --ticket-id 21 --event-id 8
 ```
 
 最近一次本地非支付链路验收结果（支付、退款、支付网关回调不在本轮范围）：
 
 | 测试项 | 结果 |
 |------|------|
-| 高并发同票档抢购 | 300 请求中 53 单成功，247 次被单飞锁快速失败保护 |
-| 零超卖 | `ticket_id=1` 库存 200，最终 MySQL 200 单、remaining=0、Redis stock=0 |
-| 售罄过滤 | 售罄后 100 并发请求新增成功 0 |
-| 活动级跨票档限购 | 用户 1 在活动 1 累计到 5 张后，第 6 张被拒 |
-| RabbitMQ 短暂不可用 | 停 MQ 后 10 单进入 Stream PEL，恢复后 PEL 清零并落库 10 单 |
-| 重复消息幂等 | 手动复投同一 orderId，订单数和 MySQL 库存不重复变化 |
-| 主动取消回滚 | 订单状态变为 2，`order_event_log.status=1`，MySQL/Redis 库存同步回补 |
-| Redis 回滚故障补偿 | Redis 停机取消仍成功写 MySQL 与消息表，恢复后补偿成功 |
+| 活动级跨票档限购 | `ticket_id=21/22/23` 同活动累计到 5 张后，第 6 张被拒 |
+| 高并发同票档抢购 | `ticket_id=21`，100 请求 / 100 并发，成功 99 单，1 次用户级限流 |
+| 零超卖与售罄过滤 | `ticket_id=21` 库存 200，最终 MySQL remaining=0、Redis stock=0；售罄后新增成功 0 |
+| RabbitMQ 短暂不可用 | `ticket_id=24` 停 MQ 后 10 单进入 Stream PEL，恢复后 PEL 10→0 并落库 |
+| 主动取消回滚 | 创建待支付订单后主动取消，`order_event_log` 无待处理，MySQL/Redis 库存一致 |
+| 自动对账 | `verify.mjs` 对 `ticket_id=21/event_id=8` 与 `ticket_id=24/event_id=9` 均输出 PASS |
 
-当前观察：`SoldOutCache` 的同票档 `tryLock` 快速失败策略能有效保护后端，但在未售罄高并发窗口也会显著压低成功吞吐；后续可考虑仅在售罄回查竞争时快速失败，或引入极短等待/二次读缓存策略。
+当前观察：`SoldOutCache` 已从锁竞争直接失败改为短暂复查后温和放行，未售罄高并发窗口不再出现大面积“请求过于火爆”误杀；售罄确认仍由 Caffeine + Redis soldout + Lua 原子扣减共同兜底。
 
 ---
 
@@ -537,6 +535,9 @@ node .\tests\seckill\load-test.mjs
 ├── tests/
 │   └── seckill/
 │       ├── load-test.mjs                   # 抢购链路压测脚本（Node 20 原生 fetch）
+│       ├── verify.mjs                      # MySQL / Redis / RabbitMQ 自动对账
+│       ├── reset-test-env.ps1              # 重建测试库、清 Redis/MQ、重启后端
+│       ├── results/                        # 完整测试日志与 summary.md
 │       └── 抢购链路测试方案.md              # 可执行测试方案 + 对账 SQL/Redis 命令
 │
 └── 开发文档.md                              # 完整开发说明书

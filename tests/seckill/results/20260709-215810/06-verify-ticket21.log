@@ -1,0 +1,20 @@
+﻿node : mysql: [Warning] Using a password on the command line interface can be insecure.
+At line:2 char:93
++ ... -Seconds 5; node .\tests\seckill\verify.mjs --ticket-id 21 --event-id ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (mysql: [Warning...an be insecure.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+mysql: [Warning] Using a password on the command line interface can be insecure.
+
+=== Seckill verify ticket=21, event=8 ===
+PASS mysql stock invariant - ticket=21, total=200, remaining=0, occupied=200, calculated=200
+PASS redis stock matches mysql - ticket=21, redis=0, mysqlRemaining=0
+PASS mysql event purchase limit - event=8, maxEffectiveQtyPerUser=5
+PASS redis stream pel - pending=0
+PASS rabbit order.create empty - messages=0, unacked=0, consumers=2
+PASS rabbit order.dead empty - messages=0
+PASS order_event_log no pending - 1	1
+PASS refund no pending - <empty>

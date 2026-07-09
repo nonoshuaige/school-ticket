@@ -1,0 +1,38 @@
+﻿
+==> Checking paths
+
+==> Ensuring Docker containers are running
+
+==> Stopping backend on port 8080
+Stopping process on port 8080: pid=33684
+
+==> Rebuilding MySQL test database
+powershell : mysql: [Warning] Using a password on the command line interface can be insecure.
+At line:2 char:249
++ ... _DIR=$dir"; powershell -ExecutionPolicy Bypass -File "D:\MyProjrct\te ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (mysql: [Warning...an be insecure.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+
+
+==> Flushing Redis and recreating order stream group
+OK
+OK
+
+==> Purging RabbitMQ queues
+Purged RabbitMQ queue: order.create.queue
+Purged RabbitMQ queue: order.delay.queue
+Purged RabbitMQ queue: order.close.queue
+Purged RabbitMQ queue: order.dead.queue
+Purged RabbitMQ queue: note.like.queue
+Purged RabbitMQ queue: note.create.queue
+Purged RabbitMQ queue: note.delete.queue
+Purged RabbitMQ queue: user.follow.queue
+
+==> Starting backend
+
+==> Warming event endpoint
+
+==> Reset complete
+Backend: http://localhost:8080
+Run verify: node .\tests\seckill\verify.mjs --ticket-id 21 --event-id 8

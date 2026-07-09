@@ -1,0 +1,32 @@
+﻿Stopping RabbitMQ container...
+rabbitmq
+
+=== Seckill 24 ===
+mode: mq-failover
+baseUrl: http://localhost:8080/api/v1
+ticketId: 24, quantity: 1
+users: 10, requests: 10, concurrency: 1
+durationMs: 150
+throughputRps: 66.83
+successOrders: 10
+uniqueSuccessOrders: 10
+latencyMs p50=14.57 p95=17.58 p99=17.58 max=17.58
+
+HTTP status:
+  200: 10
+
+Business result:
+  200 success: 10
+
+PEL while RabbitMQ is down:
+10
+1783605743008-0
+1783605743142-0
+bridge-1
+10
+
+Starting RabbitMQ container...
+rabbitmq
+
+PEL after RabbitMQ recovery:
+0

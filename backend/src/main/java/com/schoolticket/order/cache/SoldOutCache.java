@@ -2,7 +2,6 @@ package com.schoolticket.order.cache;
 
 import com.github.benmanes.caffeine.cache.Cache;
 import com.github.benmanes.caffeine.cache.Caffeine;
-import com.schoolticket.common.BusinessException;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.redis.core.StringRedisTemplate;
@@ -13,11 +12,13 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.ReentrantLock;
 
 /**
- * 本地售罄缓存：Caffeine 5秒过期 + 单飞锁防击穿。
- * 只存 soldOut=true 的 ticketId，未命中 = 未售罄。
+ * Local sold-out cache.
  *
- * 单飞锁：tryLock 抢锁，抢到的查 Redis 并写入 Caffeine，
- * 没抢到的直接快速失败，避免热点窗口大量请求占住业务线程。
+ * Only soldOut=true is cached. When cache misses, one request per ticket checks
+ * the Redis sold-out flag and fills Caffeine. Competing requests briefly recheck
+ * the local cache and then continue to the normal Redis precheck/Lua path if no
+ * sold-out flag has been filled. This preserves sold-out short-circuiting
+ * without rejecting valid high-concurrency requests before stock is exhausted.
  */
 @Slf4j
 @Component
@@ -44,7 +45,6 @@ public class SoldOutCache {
     }
 
     public boolean checkSoldOut(Long ticketId) {
-        // 快速路径：Caffeine 命中
         Boolean cached = cache.getIfPresent(ticketId);
         if (Boolean.TRUE.equals(cached)) {
             return true;
@@ -54,7 +54,6 @@ public class SoldOutCache {
 
         if (lock.tryLock()) {
             try {
-                // 拿到锁后双重检查：可能 Caffeine 已被写入（极少情况）
                 cached = cache.getIfPresent(ticketId);
                 if (Boolean.TRUE.equals(cached)) {
                     return true;
@@ -68,15 +67,19 @@ public class SoldOutCache {
                 }
                 return soldOut;
             } catch (Exception e) {
-                log.error("单飞锁查Redis售罄异常 ticketId={}", ticketId, e);
+                log.error("Sold-out Redis recheck failed, ticketId={}", ticketId, e);
                 return false;
             } finally {
                 lock.unlock();
                 locks.remove(ticketId, lock);
             }
-        } else {
-            // 没抢到锁说明同票档已有线程在回查 Redis。直接快速失败，保护后续 Lua/队列链路。
-            throw new BusinessException("请求过于火爆，请稍后重试");
         }
+
+        try {
+            TimeUnit.MILLISECONDS.sleep(5);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return Boolean.TRUE.equals(cache.getIfPresent(ticketId));
     }
 }
