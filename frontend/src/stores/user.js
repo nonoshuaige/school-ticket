@@ -20,6 +20,9 @@ export const useUserStore = defineStore('user', () => {
   async function fetchUserInfo() {
     try {
       userInfo.value = await getUserInfo()
+      if (userInfo.value?.userId) {
+        localStorage.setItem('currentUserId', String(userInfo.value.userId))
+      }
     } catch {
       // ignore
     }
@@ -31,6 +34,7 @@ export const useUserStore = defineStore('user', () => {
     isLoggedIn.value = false
     localStorage.removeItem('isLoggedIn')
     localStorage.removeItem('authToken')
+    localStorage.removeItem('currentUserId')
   }
 
   return { userInfo, isLoggedIn, login, fetchUserInfo, logout }

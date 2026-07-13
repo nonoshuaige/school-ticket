@@ -2,30 +2,35 @@ package com.schoolticket.user.service;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
 import com.schoolticket.common.BusinessException;
+import com.schoolticket.config.RabbitMQConfig;
 import com.schoolticket.dto.CursorPage;
 import com.schoolticket.note.service.RedisNoteRankingService;
+import com.schoolticket.note.service.FeedEventPublisher;
 import com.schoolticket.user.entity.UserFollow;
 import com.schoolticket.user.entity.User;
 import com.schoolticket.user.mapper.UserFollowMapper;
 import com.schoolticket.user.mapper.UserMapper;
 import lombok.RequiredArgsConstructor;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.util.*;
 import java.util.stream.Collectors;
 
 @Service
 @RequiredArgsConstructor
+@Slf4j
 public class UserFollowService {
 
     private final UserFollowMapper userFollowMapper;
     private final UserMapper userMapper;
     private final RedisFollowService redisFollowService;
     private final RedisNoteRankingService noteRankingService;
-    private final RabbitTemplate rabbitTemplate;
+    private final FeedEventPublisher feedEventPublisher;
 
     @Value("${feed.middle-v-enter-threshold:1000}")
     private int middleVEnterThreshold;
@@ -56,23 +61,7 @@ public class UserFollowService {
         uf.setUserId(userId);
         userFollowMapper.insert(uf);
 
-        // 同步更新 Redis ZSET（快速路径）
-        redisFollowService.addFollow(followerId, userId);
-        noteRankingService.markUserActive(followerId, Collections.singleton(userId));
-
-        long newFanCount = redisFollowService.getFansCount(userId);
-        RedisNoteRankingService.AuthorFanoutTier tier = resolveAuthorFanoutTier(userId, newFanCount);
-
-        // 普通/中腰部作者同步回填；大V 读时从发件箱拉取，不写入收件箱
-        if (tier != RedisNoteRankingService.AuthorFanoutTier.BIG) {
-            noteRankingService.backfillInboxForNewFan(followerId, userId);
-        }
-
-        Map<String, Object> msg = new HashMap<>();
-        msg.put("action", "follow");
-        msg.put("followerId", followerId);
-        msg.put("userId", userId);
-        rabbitTemplate.convertAndSend("school.ticket.exchange", "user.follow", msg);
+        afterCommit(() -> syncFollowChange("follow", followerId, userId));
     }
 
     @Transactional
@@ -82,19 +71,33 @@ public class UserFollowService {
                         .eq(UserFollow::getFollowerId, followerId)
                         .eq(UserFollow::getUserId, userId));
 
-        redisFollowService.removeFollow(followerId, userId);
-        noteRankingService.removeActiveFan(userId, followerId);
+        afterCommit(() -> syncFollowChange("unfollow", followerId, userId));
+    }
 
-        long newFanCount = redisFollowService.getFansCount(userId);
-        resolveAuthorFanoutTier(userId, newFanCount);
-
-        noteRankingService.removeAuthorFromInbox(followerId, userId);
-
+    private void syncFollowChange(String action, Long followerId, Long userId) {
         Map<String, Object> msg = new HashMap<>();
-        msg.put("action", "unfollow");
+        msg.put("action", action);
         msg.put("followerId", followerId);
         msg.put("userId", userId);
-        rabbitTemplate.convertAndSend("school.ticket.exchange", "user.follow", msg);
+        runSafely("publish user.follow", () ->
+                feedEventPublisher.publish(RabbitMQConfig.RK_FOLLOW, msg));
+
+        runSafely("sync follow cache", () -> {
+            if ("follow".equals(action)) {
+                redisFollowService.addFollow(followerId, userId);
+                noteRankingService.markUserActive(followerId, Collections.singleton(userId));
+                RedisNoteRankingService.AuthorFanoutTier tier = resolveAuthorFanoutTier(
+                        userId, redisFollowService.getFansCount(userId));
+                if (tier != RedisNoteRankingService.AuthorFanoutTier.BIG) {
+                    noteRankingService.backfillInboxForNewFan(followerId, userId);
+                }
+            } else {
+                redisFollowService.removeFollow(followerId, userId);
+                noteRankingService.removeActiveFan(userId, followerId);
+                resolveAuthorFanoutTier(userId, redisFollowService.getFansCount(userId));
+                noteRankingService.removeAuthorFromInbox(followerId, userId);
+            }
+        });
     }
 
     public boolean isFollowing(Long followerId, Long userId) {
@@ -204,5 +207,26 @@ public class UserFollowService {
                 middleVExitThreshold,
                 bigVEnterThreshold,
                 bigVExitThreshold);
+    }
+
+    private void afterCommit(Runnable action) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    action.run();
+                }
+            });
+        } else {
+            action.run();
+        }
+    }
+
+    private void runSafely(String actionName, Runnable action) {
+        try {
+            action.run();
+        } catch (Exception e) {
+            log.error("Feed after-commit action failed: {}", actionName, e);
+        }
     }
 }

@@ -122,7 +122,7 @@ const emojis = ['🌸','🎵','📖','🍔','🏃','📷','🎮','✨','🌈','�
 
 function readFeedCache() {
   try {
-    const raw = sessionStorage.getItem(FEED_CACHE_KEY)
+    const raw = sessionStorage.getItem(scopedFeedCacheKey())
     return raw ? JSON.parse(raw) : null
   } catch {
     return null
@@ -130,7 +130,7 @@ function readFeedCache() {
 }
 
 function saveFeedCache() {
-  sessionStorage.setItem(FEED_CACHE_KEY, JSON.stringify({
+  sessionStorage.setItem(scopedFeedCacheKey(), JSON.stringify({
     feedMode: feedMode.value,
     notes: notes.value,
     nextCursor: nextCursor.value,
@@ -140,7 +140,13 @@ function saveFeedCache() {
 }
 
 function clearFeedCache() {
-  sessionStorage.removeItem(FEED_CACHE_KEY)
+  sessionStorage.removeItem(scopedFeedCacheKey())
+}
+
+function scopedFeedCacheKey() {
+  if (!userStore.isLoggedIn) return `${FEED_CACHE_KEY}:guest`
+  const userId = userStore.userInfo?.userId || localStorage.getItem('currentUserId') || 'pending'
+  return `${FEED_CACHE_KEY}:user:${userId}`
 }
 
 function coverGradient(id) { return gradients[id % gradients.length] }
@@ -301,12 +307,19 @@ async function toggleFollow(item) {
   try {
     if (item.isFollowing) {
       await unfollowUser(item.userId)
-      item.isFollowing = false
+      notes.value.forEach(note => {
+        if (note.userId === item.userId) note.isFollowing = false
+      })
+      if (feedMode.value === 'following') {
+        notes.value = notes.value.filter(note => note.userId !== item.userId)
+      }
       showToast('已取消关注')
       saveFeedCache()
     } else {
       await followUser(item.userId)
-      item.isFollowing = true
+      notes.value.forEach(note => {
+        if (note.userId === item.userId) note.isFollowing = true
+      })
       showToast('关注成功')
       saveFeedCache()
     }

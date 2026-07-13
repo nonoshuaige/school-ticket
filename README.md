@@ -1,10 +1,10 @@
 # 🎫 校园活动票务系统
 
-> v5.0 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**、**热门互动链路**与**种草笔记**四大核心场景。
+> v5.1 · Vue 3 + Spring Boot + MySQL + Redis + RabbitMQ 全栈校园票务平台，聚焦**高并发抢购**、**双 Feed 流推荐**、**热门互动链路**与**种草笔记**四大核心场景。
 
 ## 项目简介
 
-面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统：笔记可关联活动，笔记卡片显示种草徽章，详情页展示活动卡片并一键跳转购票。v4.7 补强 Feed 体验：推荐流仅下拉刷新生成新快照，详情返回恢复原列表与滚动位置，关注状态批量检查避免 N+1。v4.8 关注流升级为普通作者全量 fanout、中腰部作者仅向 7 天活跃粉丝 fanout、大 V 读时拉取的三段式架构，并使用 1000/800、10000/8000 滞回阈值避免等级抖动。v4.9 补强热门互动链路：点赞 Redis 幂等先行 + RabbitMQ 异步落库 + 延迟校准，评论前 3 页 Redis 热缓存 + 评论数计数器，适配热门内容高并发读写。v5.0 修复抢购售罄单飞锁策略，竞争失败短暂复查后温和放行，并补齐非支付链路 reset / mode / verify 自动化测试闭环。项目从零构建了完整的订单履约闭环、Feed 流信息流系统与互动高并发链路。
+面向毕业晚会、歌手大赛等校内热门活动的票务开售场景，同时提供笔记社区供学生分享活动体验。v4.0 新增种草笔记系统；v4.7-v4.9 完成 Feed、关注流与热门互动链路升级；v5.0 修复抢购售罄单飞锁策略并补齐自动化测试。v5.1 移除订单热表外键锁升级，票档元数据改走 Caffeine+Redis，成单死信可幂等补偿，延时关单按批处理，并通过 10,000 用户四档库存压测。项目从零构建了完整的订单履约闭环、Feed 流信息流系统与互动高并发链路。
 
 ## 🎯 核心亮点
 
@@ -21,9 +21,11 @@
   │
   ├─ 2. Redis 售罄预检（Java 侧 GET soldout，比 Lua 更快失败）
   │
-  ├─ 3. Redis 库存预检（GET stock < qty? → 返回售罄）
+  ├─ 3. Caffeine + Redis 票档销售元数据（首次 miss 单飞回源 MySQL）
   │
-  ├─ 4. Redis 限购预检（HGET event:purchase:{eventId} userId → current+qty > 5?）
+  ├─ 4. Redis 库存预检（GET stock < qty? → 返回售罄）
+  │
+  ├─ 5. Redis 限购预检（HGET event:purchase:{eventId} userId → current+qty > 5?）
   │        以上三层预检层层削减：售罄概率 > 库存不足 > 单人限购
   │
   ├─ 5. Snowflake 预生成订单号 + 构建排队中订单（status=-1）
@@ -50,16 +52,15 @@
   │      └─ order.delay.queue(TTL=15min) → order.close.queue 超时关单
   │
   │      ▼
-  │  OrderCloseConsumer @RabbitListener
-  │      │  CAS 条件更新：status=0 && expire_time<=now 才能关单
-  │      │  写 order_event_log 驱动 Redis 回滚，重复消息幂等跳过
+  │  OrderCloseConsumer @RabbitListener（每批最多 200 个 orderId）
+  │      │  批量锁定 status=0 && expire_time<=now 的订单并 CAS 关单
+  │      │  按票档聚合回补 MySQL，逐单写 order_event_log 驱动 Redis 回滚
   │      │
   │      ▼
   │  OrderCreateConsumer @RabbitListener
-  │      │  INSERT order + 原子扣减 MySQL ticket_category.remaining_quantity (同事务)
-  │      │  刷新 Redis: status=-1(排队中) → status=0(待支付) + 真实 createTime
-  │      │  DuplicateKeyException → 幂等跳过
-  │      │  异常 → 抛回 RabbitMQ 重试 / DXL
+  │      │  INSERT IGNORE order + 原子扣减 MySQL remaining（同事务，订单表无外键）
+  │      │  提交后刷新 Redis: status=-1 → status=0
+  │      │  重试仍失败 → order.create.dead.queue → 查库后幂等回滚 Redis
   │      │
   │      ▼ 查询 GET /order/{orderNo} 或 /order/list → Redis 优先，全程不穿透 DB
   
@@ -96,6 +97,9 @@
 | Stream 不可靠（内存级） | Stream→RabbitMQ 桥接线程 + PEL 兜底重投，同时投递成单队列与延时关单队列（v4.6） | 磁盘级可靠，消息不因 Redis 重启丢失 |
 | MQ 投递确认窗口 | RabbitMQ `publisher-confirm-type=correlated`，成单与延时两条消息均 confirm ack 后才 XACK Redis Stream（v4.7） | 避免 publish 未被 broker 确认时提前 ack Stream |
 | MySQL 库存口径 | OrderCreateConsumer 插入订单与 `remaining_quantity -= qty` 同事务；取消/退款/超时使用原子 `remaining_quantity += qty`（v4.7） | Redis 热库存与 MySQL 最终库存对称一致 |
+| 订单外键死锁 | 订单热表移除 user/ticket 外键，保留逻辑关联索引；`INSERT IGNORE` 返回值判定幂等（v5.1） | 消除外键共享锁升级库存排他锁的并发死锁 |
+| 成单最终失败 | 独立创建死信队列查库核对；订单不存在才执行带 orderNo 标记的幂等 rollback.lua（v5.1） | MQ 重试耗尽后不泄漏 Redis 库存与限购额度 |
+| 超时关单洪峰 | Close Consumer 每批最多 200 个 orderId，批量锁定/关单并按票档聚合回补（v5.1） | 降低 15 分钟同批订单逐单查询压力 |
 | 支付/关单状态冲突 | 状态机 + CAS 条件更新（status 前置条件 + expire_time 条件） | 支付、取消、超时、退款、核销并发时仅一个流转成功 |
 | 活动缓存击穿 | 逻辑过期 + 互斥锁（SET NX），物理 TTL=逻辑+30min 缓冲，过期返回旧值异步重建（v4.1） | 大量并发不再穿透 DB |
 | Pool 重建空窗期 | 临时 ZSET 构建 + RENAME 原子替换，避免先删后建（v4.5） | 重建期间查询不返回空列表 |
@@ -146,8 +150,9 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 │       ▼  shuffle → user:bloom:seen:{userId}  │
 │       │   Bloom 去重 → 截取 200              │
 │       ▼                                      │
-│  feed:recommend:{userId} (List, 30min)       │
-│       │  session 级私有快照，未登录 → userId=0 │
+│  feed:recommend:user:{userId} (List, 30min)  │
+│  feed:recommend:anon:{sessionId}             │
+│       │  登录用户/匿名浏览器会话完全隔离         │
 │       ▼                                      │
 │  LPOP pageSize 条 → VO 缓存批量读 → 响应      │
 │                                              │
@@ -172,7 +177,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 │  读取时合并两源:                                │
 │    ├─ 收件箱 feed:following:{userId}（推内容）  │
 │    ├─ 中腰部/大V note:mine:{authorId}（拉内容） │
-│    ├─ 按时间戳 merge → 游标分页                 │
+│    ├─ 按 (时间戳,noteId) merge → 复合游标分页    │
 │       │                                      │
 │       ▼                                      │
 │  VO 缓存批量读 → 响应                          │
@@ -188,9 +193,10 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | Redis Key | 类型 | TTL | 用途 |
 |-----------|------|-----|------|
 | `note:latest` | ZSET | 1天 | 全站最新候选池，过期从 DB 重建 |
-| `note:hottest` | ZSET | 1天 | 热度排行（点赞数） |
+| `note:hottest` | 预留 | — | 热度排行预留键；当前推荐链路不构建、不读取 |
 | `user:bloom:seen:{userId}` | String (Bitmap) | 7天 | 布隆过滤器，~12KB/人，曝光消重 |
-| `feed:recommend:{userId}` | List | 30分钟 | Session 私有快照队列 |
+| `feed:recommend:user:{userId}` | List | 30分钟 | 登录用户 Session 私有快照队列 |
+| `feed:recommend:anon:{sessionId}` | List | 30分钟 | 匿名浏览器会话快照，`feed_session` HttpOnly Cookie 隔离 |
 | `note:vo:{noteId}` | Hash | 7天 | 笔记全量 VO 缓存（按需写入） |
 | `note:like:count:{noteId}` | String | 7天 | Redis 先行点赞计数器 |
 | `user:likes:{userId}` | Set | 3天 | 用户点赞集合，O(1) SISMEMBER 判赞 |
@@ -213,11 +219,13 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | 空白布隆短路 | 无 | EXISTS 跳过 | 节省 130ms |
 
 > 推荐流冷启动 ~420ms（含 Lettuce 首连接 ~220ms），热路径 **23-30ms**。
+>
+> 当前推荐策略保持不变：从 `note:latest` 最新候选池随机打散并进行 Bloom 曝光消重；`note:hottest` 暂不参与排序，也未引入画像或个性化打分。
 
 **Feed 体验与关注状态优化（v4.7）：**
 
-- 推荐流不再在每次进入 `/notes` 时强制刷新：仅下拉刷新生成新快照，继续下滑复用 `feed:recommend:{userId}` 私有队列 `LPOP pageSize`。
-- 前端使用 `sessionStorage` 保存当前 Feed Tab、列表、游标和滚动位置，进入笔记详情后返回可恢复原列表和原滚动位置。
+- 推荐流不再在每次进入 `/notes` 时强制刷新：仅下拉刷新生成新快照，继续下滑复用用户/匿名会话私有队列 `LPOP pageSize`。
+- 前端使用按用户隔离的 `sessionStorage` 保存当前 Feed Tab、列表、游标和滚动位置，切换账号不会恢复其他账号的点赞、关注状态。
 - 滚动接近底部自动触发 `loadMore`，同时保留"加载更多"按钮作为显式兜底。
 - 新增 `POST /api/v1/user/follow/check/batch` 批量关注检查接口，替代 Feed 卡片逐条 `checkFollowing`，消除前端 N+1 请求。
 - 批量接口使用 `/check/batch` 多段路径，避免被 `POST /user/follow/{userId}` 误匹配。
@@ -240,13 +248,23 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 - **发帖分支**：普通作者 → 推给所有粉丝；中腰部作者 → 仅推给最近 7 天活跃粉丝；大V → 不 fanout，仅写 `note:mine` + 标记 `bigv:ids`
 - **等级滞回**：普通作者粉丝数达到 1000 才进入中腰部，进入后跌破 800 才退回普通；中腰部达到 10000 才进入大V，进入后跌破 8000 才退回中腰部，避免在边界反复切换策略
 - **活跃粉丝定义**：最近 7 天访问过 `/notes`（推荐/关注 Tab）或 `/following-feed` 的用户，访问时写入 `user:active:{userId}` 和其关注作者的 `author:active_fans:{authorId}`
-- **读时合并**：收件箱（普通作者全量推 + 中腰部活跃推内容）+ 中腰部/大V `note:mine` 拉取 → 按时间戳降序合并 → 游标分页
-- **关注联动**：关注/取关在主流程同步维护收件箱（关注回填最近 50 条，取关清理该作者笔记）+ RabbitMQ 异步兜底，避免 MQ 未启动时关注关系已生效但关注流缺旧笔记；同时检查是否触发/摘除大V 标记
+- **读时合并**：收件箱 + 中腰部/大V `note:mine` 拉取 → 按 `(发布时间,noteId)` 倒序 → 读取 `pageSize+1` 判断续页；相同时间戳不会漏项
+- **冷恢复**：中腰部/大V 读取前确保 `note:mine:{authorId}` 已加载，TTL 过期后从 MySQL 自动重建
+- **关注联动**：关注/取关在数据库提交后发布 Confirm 消息并更新收件箱（关注回填最近 50 条，取关清理该作者笔记）；消费者失败重试 3 次后进入 `feed.dead.queue`
 - **配置项**：`feed.middle-v-enter-threshold: 1000`、`feed.middle-v-exit-threshold: 800`、`feed.big-v-enter-threshold: 10000`、`feed.big-v-exit-threshold: 8000`、`feed.active-days: 7`
 
 **按用户懒加载 + TTL 过期（v3.6）：**
 
-冷启动仅同步 `note:latest` + `note:hottest` 全局池。用户级数据（关注、粉丝、收件箱、点赞集合、我的笔记）在首次访问对应功能时从 MySQL 按需重建并自动设置 TTL。不活跃用户不消耗 Redis 内存。
+冷启动仅同步 `note:latest` 和点赞计数器。用户级数据（关注、粉丝、收件箱、点赞集合、我的笔记）在首次访问对应功能时从 MySQL 按需重建并自动设置 TTL。不活跃用户不消耗 Redis 内存。
+
+**Feed 完整性与可靠性修复：**
+
+- Bloom Pipeline 解析固定消费每个候选的 7 个 bit 结果，避免下标错位造成误判。
+- 空关注、空粉丝、空点赞、空发件箱使用同 TTL 的 `cache:loaded:*` 标记，避免空集合反复穿透 MySQL。
+- 普通作者 fanout 使用 Redis Pipeline 批量执行 `ZADD + ZREMRANGE + EXPIRE`。
+- 创建、删除、关注事件在数据库事务提交后发布，发布端等待 RabbitMQ Confirm；消费异常不再吞掉。
+- `note.create`、`note.delete`、`note.like`、`user.follow` 统一启用 3 次退避重试，最终失败进入 `feed.dead.queue`。
+- `POST /api/v1/note/sync-to-redis` 需要登录，避免匿名触发全量同步。
 
 ---
 
@@ -351,7 +369,7 @@ Cache<Long, Boolean> cache = Caffeine.newBuilder()
 | 数据库 | MySQL 8.0 | 11 张表，100 用户 / 15 活动 / 200 笔记 / 10 种草关联 |
 | 缓存 | Redis 7.4 (Alpine) | ZSET 游标分页 + Lua 脚本 + Stream + Bitmap 布隆 |
 | 本地缓存 | Caffeine | 售罄标记，5s TTL |
-| 消息队列 | RabbitMQ 3.13 (Alpine) | 8 个 Queue（笔记/关注 + 订单创建/延时关单/死信），异步兜底 + 可靠落库 |
+| 消息队列 | RabbitMQ 3.13 (Alpine) | Feed 与订单独立重试/死信队列，publisher confirm + 异步兜底 |
 | 容器 | Docker Desktop | Redis + RabbitMQ |
 
 ---
@@ -379,14 +397,14 @@ docker start rabbitmq
 ```bash
 mysql -u root -p123456 --default-character-set=utf8mb4 -D school_ticket < backend/init.sql
 
-# 启动后端后，同步全局池
-curl -X POST http://localhost:8080/api/v1/note/sync-to-redis
-
-# 登录测试账号并同步关注关系
+# 启动后端后先登录测试账号
 curl -X POST http://localhost:8080/api/v1/auth/login \
   -H "Content-Type: application/json" \
   -d '{"phone":"13800138000","password":"123456"}' \
   -c cookies.txt
+
+# 同步全局最新池、点赞计数器和当前用户关注关系
+curl -X POST http://localhost:8080/api/v1/note/sync-to-redis -b cookies.txt
 curl -X POST http://localhost:8080/api/v1/user/follow/sync-to-redis -b cookies.txt
 ```
 
@@ -432,9 +450,10 @@ npm run dev
 
 - `tests/seckill/抢购链路测试方案.md`
 - `tests/seckill/load-test.mjs`：支持 `--mode load|limit|soldout|mq-failover|cancel-rollback`
+- `tests/seckill/benchmark-matrix.mjs`：10,000 用户、1,000/2,000/5,000/10,000 库存矩阵
 - `tests/seckill/verify.mjs`：自动检查 MySQL / Redis / RabbitMQ 并输出 PASS / FAIL
 - `tests/seckill/reset-test-env.ps1`：重建测试库、清 Redis、清 MQ、重启后端
-- `tests/seckill/results/20260709-215810/summary.md`：最近一次完整测试结果
+- `tests/seckill/results/20260710-223149/benchmark-summary.md`：最近一次 10,000 用户矩阵结果
 
 运行示例：
 
@@ -442,6 +461,7 @@ npm run dev
 cd D:\MyProjrct
 powershell -ExecutionPolicy Bypass -File .\tests\seckill\reset-test-env.ps1
 node .\tests\seckill\load-test.mjs --mode load --ticket-id 21 --quantity 1 --user-count 100 --requests 100 --concurrency 100
+node .\tests\seckill\benchmark-matrix.mjs
 node .\tests\seckill\verify.mjs --ticket-id 21 --event-id 8
 ```
 
@@ -455,6 +475,7 @@ node .\tests\seckill\verify.mjs --ticket-id 21 --event-id 8
 | RabbitMQ 短暂不可用 | `ticket_id=24` 停 MQ 后 10 单进入 Stream PEL，恢复后 PEL 10→0 并落库 |
 | 主动取消回滚 | 创建待支付订单后主动取消，`order_event_log` 无待处理，MySQL/Redis 库存一致 |
 | 自动对账 | `verify.mjs` 对 `ticket_id=21/event_id=8` 与 `ticket_id=24/event_id=9` 均输出 PASS |
+| 10,000 用户库存矩阵 | 四档全部完成异步排空与库存对账，创建死信 0、MySQL 死锁 0、Redis/MySQL 全部一致 |
 
 当前观察：`SoldOutCache` 已从锁竞争直接失败改为短暂复查后温和放行，未售罄高并发窗口不再出现大面积“请求过于火爆”误杀；售罄确认仍由 Caffeine + Redis soldout + Lua 原子扣减共同兜底。
 
@@ -498,6 +519,7 @@ node .\tests\seckill\verify.mjs --ticket-id 21 --event-id 8
 │       │   ├── purchase.lua                # 抢购 Lua：原子扣库存 + 限购 + Stream
 │       │   └── rollback.lua                # 回滚 Lua：恢复库存 + 清除售罄
 │       └── java/com/schoolticket/
+│           ├── config/FeedRabbitMQConfig.java     # Feed 重试、死信队列与消费容器
 │           ├── order/
 │           │   ├── controller/OrderController.java
 │           │   ├── entity/OrderEventLog.java       # 本地消息表实体
@@ -519,9 +541,11 @@ node .\tests\seckill\verify.mjs --ticket-id 21 --event-id 8
 │           │   ├── service/NoteService.java        # Feed 流业务编排
 │           │   ├── service/RedisNoteRankingService.java # ZSET 排行 + fanout + 点赞计数器
 │           │   ├── service/BloomFilterService.java # Bitmap 布隆过滤器
+│           │   ├── service/FeedEventPublisher.java # Feed publisher confirm 封装
 │           │   ├── service/NoteCommentService.java # 二级展平评论 + 热区缓存
 │           │   └── task/NoteLikeReconcileTask.java # 点赞计数延迟校准
 │           └── dto/                        # CursorPage, OrderVO, CommentVO 等
+│   └── src/test/.../BloomFilterServiceTest.java # Bloom Pipeline 解析回归测试
 │
 ├── frontend/                               # Vue 3 前端
 │   └── src/

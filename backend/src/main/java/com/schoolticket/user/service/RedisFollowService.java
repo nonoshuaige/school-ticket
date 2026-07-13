@@ -20,6 +20,7 @@ public class RedisFollowService {
 
     private static final String FOLLOW_KEY = "user:follow:%d";
     private static final String FANS_KEY  = "user:fans:%d";
+    private static final String LOADED_KEY = "cache:loaded:%s";
     private static final long   FOLLOW_TTL_SECONDS = 259200;
 
     // ==================== 写操作 ====================
@@ -29,18 +30,22 @@ public class RedisFollowService {
         String key = String.format(FOLLOW_KEY, followerId);
         redis.opsForZSet().add(key, String.valueOf(userId), now);
         redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key);
         String fansKey = String.format(FANS_KEY, userId);
         redis.opsForZSet().add(fansKey, String.valueOf(followerId), now);
         redis.expire(fansKey, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(fansKey);
     }
 
     public void removeFollow(Long followerId, Long userId) {
         String key = String.format(FOLLOW_KEY, followerId);
         redis.opsForZSet().remove(key, String.valueOf(userId));
         redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key);
         String fansKey = String.format(FANS_KEY, userId);
         redis.opsForZSet().remove(fansKey, String.valueOf(followerId));
         redis.expire(fansKey, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(fansKey);
     }
 
     public boolean isFollowing(Long followerId, Long userId) {
@@ -93,7 +98,7 @@ public class RedisFollowService {
     /** 确保 user:follow:{userId} 存在，过期则从 DB 重建 */
     public void ensureFollowLoaded(Long userId) {
         String key = String.format(FOLLOW_KEY, userId);
-        if (Boolean.TRUE.equals(redis.hasKey(key))) return;
+        if (isLoaded(key)) return;
         List<UserFollow> follows = userFollowMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<UserFollow>()
                         .eq(UserFollow::getFollowerId, userId));
@@ -104,12 +109,13 @@ public class RedisFollowService {
             redis.opsForZSet().add(key, String.valueOf(uf.getUserId()), score);
         }
         redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key);
     }
 
     /** 确保 user:fans:{userId} 存在，过期则从 DB 重建 */
     public void ensureFansLoaded(Long userId) {
         String key = String.format(FANS_KEY, userId);
-        if (Boolean.TRUE.equals(redis.hasKey(key))) return;
+        if (isLoaded(key)) return;
         List<UserFollow> fans = userFollowMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<UserFollow>()
                         .eq(UserFollow::getUserId, userId));
@@ -120,6 +126,17 @@ public class RedisFollowService {
             redis.opsForZSet().add(key, String.valueOf(uf.getFollowerId()), score);
         }
         redis.expire(key, FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key);
+    }
+
+    private boolean isLoaded(String dataKey) {
+        return Boolean.TRUE.equals(redis.hasKey(dataKey))
+                || Boolean.TRUE.equals(redis.hasKey(String.format(LOADED_KEY, dataKey)));
+    }
+
+    private void markLoaded(String dataKey) {
+        redis.opsForValue().set(String.format(LOADED_KEY, dataKey), "1",
+                FOLLOW_TTL_SECONDS, TimeUnit.SECONDS);
     }
 
     /** 批量获取关注时间（返回 followeeId → followTime） */

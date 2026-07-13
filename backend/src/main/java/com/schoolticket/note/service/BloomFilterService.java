@@ -94,7 +94,11 @@ public class BloomFilterService {
                     }
                     return null;
                 });
-        // 解析结果
+        return resolveFresh(offsetMap, results);
+    }
+
+    static Set<Long> resolveFresh(Map<Long, long[]> offsetMap, List<Object> results) {
+        Set<Long> fresh = new LinkedHashSet<>();
         int idx = 0;
         for (Map.Entry<Long, long[]> entry : offsetMap.entrySet()) {
             boolean seen = true;
@@ -102,7 +106,6 @@ public class BloomFilterService {
                 Object val = results.get(idx++);
                 if (!Boolean.TRUE.equals(val)) {
                     seen = false;
-                    break;
                 }
             }
             if (!seen) {

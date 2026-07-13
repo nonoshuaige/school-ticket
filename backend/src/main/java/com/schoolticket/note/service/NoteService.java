@@ -16,11 +16,12 @@ import com.schoolticket.user.mapper.UserMapper;
 import com.schoolticket.user.service.RedisFollowService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.amqp.rabbit.core.RabbitTemplate;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.time.LocalDateTime;
 import java.time.ZoneId;
@@ -39,13 +40,12 @@ public class NoteService {
     private final RedisNoteRankingService noteRankingService;
     private final RedisFollowService redisFollowService;
     private final BloomFilterService bloomFilterService;
-    private final RabbitTemplate rabbitTemplate;
+    private final FeedEventPublisher feedEventPublisher;
     private final StringRedisTemplate redis;
     private final NoteEventMapper noteEventMapper;
     private final EventService eventService;
 
-    private static final String FEED_KEY = "feed:recommend:%d";
-    private static final String FEED_FOLLOWING_KEY = "feed:following:%d";
+    private static final String FEED_KEY = "feed:recommend:%s";
     private static final int FEED_SNAPSHOT_SIZE = 200;
     private static final int FEED_TTL_MINUTES = 30;
 
@@ -67,10 +67,13 @@ public class NoteService {
      * cursor == null → 下拉刷新：生成快照推入私有 List，LPOP 首页
      * cursor != null → 上拉加载：LPOP 下一页
      */
-    public CursorPage<Map<String, Object>> recommendFeed(Long currentUserId, Long cursor, int pageSize) {
+    public CursorPage<Map<String, Object>> recommendFeed(Long currentUserId,
+                                                          String anonymousFeedId,
+                                                          Long cursor,
+                                                          int pageSize) {
         long t0 = System.currentTimeMillis();
-        Long effectiveUserId = currentUserId != null ? currentUserId : 0L;
-        String feedKey = String.format(FEED_KEY, effectiveUserId);
+        String feedOwner = currentUserId != null ? "user:" + currentUserId : "anon:" + anonymousFeedId;
+        String feedKey = String.format(FEED_KEY, feedOwner);
 
         // 懒加载：全局候选池过期则从 DB 重建
         noteRankingService.ensureLatestLoaded();
@@ -81,7 +84,7 @@ public class NoteService {
         long tSnap = 0, tPush = 0, tPop = 0, tBloom = 0, tVO = 0;
         if (cursor == null) {
             long _t = System.currentTimeMillis();
-            List<Long> snapshot = generateFeedSnapshot(effectiveUserId);
+            List<Long> snapshot = generateFeedSnapshot(currentUserId);
             tSnap = System.currentTimeMillis() - _t;
 
             _t = System.currentTimeMillis();
@@ -137,7 +140,7 @@ public class NoteService {
     }
 
     /** 从全站最新候选池中生成一个去重后的快照 ID 列表 */
-    private List<Long> generateFeedSnapshot(Long effectiveUserId) {
+    private List<Long> generateFeedSnapshot(Long currentUserId) {
         long t0 = System.currentTimeMillis();
 
         long tz = System.currentTimeMillis();
@@ -153,7 +156,9 @@ public class NoteService {
         if (candidates.isEmpty()) return Collections.emptyList();
 
         long t2 = System.currentTimeMillis();
-        List<Long> fresh = new ArrayList<>(bloomFilterService.batchFilterSeen(effectiveUserId, candidates));
+        List<Long> fresh = currentUserId == null
+                ? new ArrayList<>(candidates)
+                : new ArrayList<>(bloomFilterService.batchFilterSeen(currentUserId, candidates));
         long tBloom = System.currentTimeMillis() - t2;
 
         long t3 = System.currentTimeMillis();
@@ -167,8 +172,9 @@ public class NoteService {
 
     // ==================== 关注流（三段式推拉：普通作者全推 + 中腰部活跃推 + 大V 拉） ====================
 
-    public CursorPage<Map<String, Object>> followingFeed(Long currentUserId, Long cursor, int pageSize) {
+    public CursorPage<Map<String, Object>> followingFeed(Long currentUserId, String cursor, int pageSize) {
         if (currentUserId == null) return CursorPage.of(Collections.emptyList(), null, false, 0);
+        FeedCursor parsedCursor = FeedCursor.parse(cursor);
 
         Set<Long> followingIds = redisFollowService.getFollowingIds(currentUserId);
         if (followingIds.isEmpty()) return CursorPage.of(Collections.emptyList(), null, false, 0);
@@ -190,20 +196,13 @@ public class NoteService {
         // 3. 从收件箱拉取（普通用户推内容）— overscan 2x 以便合并后有足够余量
         Map<Long, Long> inboxEntries = new LinkedHashMap<>();
         if (!normalIds.isEmpty()) {
-            CursorPage<Map<String, Object>> inboxPage =
-                    noteRankingService.getFollowingFeedInbox(currentUserId, cursor, pageSize * 2);
-            String inboxKey = String.format(FEED_FOLLOWING_KEY, currentUserId);
-            for (Map<String, Object> m : inboxPage.getRecords()) {
-                Long nid = (Long) m.get("noteId");
-                Double score = redis.opsForZSet().score(inboxKey, String.valueOf(nid));
-                if (score != null) {
-                    inboxEntries.putIfAbsent(nid, score.longValue());
-                }
-            }
+            inboxEntries.putAll(noteRankingService.getFollowingInboxEntries(
+                    currentUserId, parsedCursor.score(), parsedCursor.noteId(), pageSize + 1));
         }
 
         // 4. 从中腰部/大V 发件箱拉取。中腰部只推活跃粉丝，读时仍拉取以覆盖回流用户。
-        Map<Long, Long> pullEntries = noteRankingService.pullFromBigVs(pullAuthorIds, cursor, pageSize);
+        Map<Long, Long> pullEntries = noteRankingService.pullFromBigVs(
+                pullAuthorIds, parsedCursor.score(), parsedCursor.noteId(), pageSize + 1);
 
         // 5. 合并两个来源的 (noteId → score)，按时间戳降序排列
         Map<Long, Long> allEntries = new LinkedHashMap<>();
@@ -213,16 +212,17 @@ public class NoteService {
         }
 
         List<Map.Entry<Long, Long>> sorted = allEntries.entrySet().stream()
-                .sorted(Map.Entry.<Long, Long>comparingByValue().reversed())
+                .sorted(Map.Entry.<Long, Long>comparingByValue().reversed()
+                        .thenComparing(Map.Entry.<Long, Long>comparingByKey().reversed()))
                 .collect(Collectors.toList());
 
         // 6. 截断取 pageSize 条，计算 nextCursor
         List<Long> pageNoteIds = new ArrayList<>();
-        Long nextCursor = null;
+        FeedCursor nextCursor = null;
         for (int i = 0; i < Math.min(pageSize, sorted.size()); i++) {
             Map.Entry<Long, Long> e = sorted.get(i);
             pageNoteIds.add(e.getKey());
-            nextCursor = e.getValue();
+            nextCursor = new FeedCursor(e.getValue(), e.getKey());
         }
         boolean hasMore = sorted.size() > pageSize;
 
@@ -231,7 +231,26 @@ public class NoteService {
         }
 
         List<Map<String, Object>> records = assembleNoteVOsWithRepair(pageNoteIds, currentUserId);
-        return CursorPage.of(records, nextCursor != null ? String.valueOf(nextCursor) : null, hasMore, records.size());
+        return CursorPage.of(records, nextCursor != null ? nextCursor.encode() : null, hasMore, records.size());
+    }
+
+    private record FeedCursor(Long score, Long noteId) {
+        private static FeedCursor parse(String raw) {
+            if (raw == null || raw.isBlank()) return new FeedCursor(null, null);
+            String[] parts = raw.split(":", 2);
+            if (parts.length != 2) {
+                throw new BusinessException(400, "无效的关注流游标");
+            }
+            try {
+                return new FeedCursor(Long.valueOf(parts[0]), Long.valueOf(parts[1]));
+            } catch (NumberFormatException e) {
+                throw new BusinessException(400, "无效的关注流游标");
+            }
+        }
+
+        private String encode() {
+            return score + ":" + noteId;
+        }
     }
 
     // ==================== 我的笔记（独立分页） ====================
@@ -273,49 +292,43 @@ public class NoteService {
         noteMapper.insert(note);
 
         // 0.5. 写入 note→event 关联
-        if (eventIds != null && !eventIds.isEmpty()) {
-            for (Long eid : eventIds) {
+        List<Long> committedEventIds = eventIds == null ? Collections.emptyList() : List.copyOf(eventIds);
+        if (!committedEventIds.isEmpty()) {
+            for (Long eid : committedEventIds) {
                 NoteEvent ne = new NoteEvent();
                 ne.setNoteId(note.getNoteId());
                 ne.setEventId(eid);
                 noteEventMapper.insert(ne);
             }
-            noteRankingService.cacheNoteEvents(note.getNoteId(), eventIds);
-        } else {
-            noteRankingService.cacheNoteEvents(note.getNoteId(), Collections.emptyList());
         }
 
-        // 1. 写入 VO 缓存
-        writeNoteVOToCache(note);
-
-        // 2. 同步写入 latest + mine ZSET
-        noteRankingService.addNote(note);
-
-        // 3. 三段式推拉：普通作者全量推，中腰部只推活跃粉丝，大V 只写 mine 不 fanout
-        long timestamp = toEpochMilli(note.getCreateTime());
-        long fanCount = redisFollowService.getFansCount(userId);
-        RedisNoteRankingService.AuthorFanoutTier tier = resolveAuthorFanoutTier(userId, fanCount);
-        Set<Long> fanIds;
-        if (tier == RedisNoteRankingService.AuthorFanoutTier.NORMAL) {
-            fanIds = redisFollowService.getFanIds(userId);
-            noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
-        } else if (tier == RedisNoteRankingService.AuthorFanoutTier.MIDDLE) {
-            fanIds = noteRankingService.getActiveFanIds(userId);
-            noteRankingService.fanoutToFollowers(userId, note.getNoteId(), timestamp, fanIds);
-        } else {
-            fanIds = Collections.emptySet();
-        }
-
-        // 4. MQ 异步兜底
-        Map<String, Object> msg = new HashMap<>();
-        msg.put("noteId", note.getNoteId());
-        msg.put("userId", userId);
-        msg.put("createTime", timestamp);
-        msg.put("bigV", tier == RedisNoteRankingService.AuthorFanoutTier.BIG);
-        msg.put("fanIds", fanIds.stream().map(String::valueOf).collect(Collectors.toList()));
-        rabbitTemplate.convertAndSend("school.ticket.exchange", "note.create", msg);
+        afterCommit(() -> syncCreatedNote(note, committedEventIds));
 
         return note;
+    }
+
+    private void syncCreatedNote(Note note, List<Long> eventIds) {
+        long timestamp = toEpochMilli(note.getCreateTime());
+        Map<String, Object> msg = new HashMap<>();
+        msg.put("noteId", note.getNoteId());
+        msg.put("userId", note.getUserId());
+        msg.put("createTime", timestamp);
+        runSafely("publish note.create", () ->
+                feedEventPublisher.publish(RabbitMQConfig.RK_NOTE_CREATE, msg));
+
+        runSafely("sync created note cache", () -> {
+            noteRankingService.cacheNoteEvents(note.getNoteId(), eventIds);
+            writeNoteVOToCache(note);
+            noteRankingService.addNote(note);
+            RedisNoteRankingService.AuthorFanoutTier tier = resolveAuthorFanoutTier(note.getUserId());
+            if (tier == RedisNoteRankingService.AuthorFanoutTier.NORMAL) {
+                noteRankingService.fanoutToFollowers(note.getUserId(), note.getNoteId(), timestamp,
+                        redisFollowService.getFanIds(note.getUserId()));
+            } else if (tier == RedisNoteRankingService.AuthorFanoutTier.MIDDLE) {
+                noteRankingService.fanoutToFollowers(note.getUserId(), note.getNoteId(), timestamp,
+                        noteRankingService.getActiveFanIds(note.getUserId()));
+            }
+        });
     }
 
     private RedisNoteRankingService.AuthorFanoutTier resolveAuthorFanoutTier(Long authorId) {
@@ -345,26 +358,25 @@ public class NoteService {
         // MyBatis-Plus @TableLogic: deleteById → UPDATE is_deleted = 1
         noteMapper.deleteById(noteId);
 
-        // 清除 note_event 关联 + Redis 缓存
+        // 清除 note_event 关联
         noteEventMapper.delete(
                 new LambdaQueryWrapper<NoteEvent>().eq(NoteEvent::getNoteId, noteId));
-        noteRankingService.deleteNoteEventsCache(noteId);
+        afterCommit(() -> syncDeletedNote(note));
+    }
 
-        // 清除 VO 缓存
-        noteRankingService.deleteNoteVO(noteId);
-
-        // 从所有粉丝收件箱移除
-        Set<Long> fanIds = redisFollowService.getFanIds(note.getUserId());
-        noteRankingService.removeFromFollowerInboxes(note.getUserId(), noteId, fanIds);
-
-        // 从全局 + mine ZSET 移除
-        noteRankingService.removeNote(note);
-
-        // RabbitMQ 异步兜底
+    private void syncDeletedNote(Note note) {
         Map<String, Object> msg = new HashMap<>();
-        msg.put("noteId", noteId);
+        msg.put("noteId", note.getNoteId());
         msg.put("userId", note.getUserId());
-        rabbitTemplate.convertAndSend("school.ticket.exchange", "note.delete", msg);
+        runSafely("publish note.delete", () ->
+                feedEventPublisher.publish(RabbitMQConfig.RK_NOTE_DELETE, msg));
+        runSafely("sync deleted note cache", () -> {
+            noteRankingService.deleteNoteEventsCache(note.getNoteId());
+            noteRankingService.deleteNoteVO(note.getNoteId());
+            noteRankingService.removeFromFollowerInboxes(note.getUserId(), note.getNoteId(),
+                    redisFollowService.getFanIds(note.getUserId()));
+            noteRankingService.removeNote(note);
+        });
     }
 
     public Map<String, Object> getNoteDetail(Long noteId, Long currentUserId) {
@@ -429,7 +441,15 @@ public class NoteService {
         msg.put("noteId", noteId);
         msg.put("userId", userId);
         msg.put("time", System.currentTimeMillis());
-        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.RK_NOTE_LIKE, msg);
+        try {
+            feedEventPublisher.publish(RabbitMQConfig.RK_NOTE_LIKE, msg);
+        } catch (RuntimeException e) {
+            noteRankingService.removeUserLikeIfPresent(userId, noteId);
+            noteRankingService.decrLikeCount(noteId);
+            noteRankingService.updateVOLikeCount(noteId, -1);
+            noteRankingService.markLikeDirty(noteId);
+            throw e;
+        }
     }
 
     public void unlike(Long noteId, Long userId) {
@@ -449,7 +469,15 @@ public class NoteService {
         msg.put("noteId", noteId);
         msg.put("userId", userId);
         msg.put("time", System.currentTimeMillis());
-        rabbitTemplate.convertAndSend(RabbitMQConfig.EXCHANGE, RabbitMQConfig.RK_NOTE_LIKE, msg);
+        try {
+            feedEventPublisher.publish(RabbitMQConfig.RK_NOTE_LIKE, msg);
+        } catch (RuntimeException e) {
+            noteRankingService.addUserLikeIfAbsent(userId, noteId);
+            noteRankingService.incrLikeCount(noteId);
+            noteRankingService.updateVOLikeCount(noteId, 1);
+            noteRankingService.markLikeDirty(noteId);
+            throw e;
+        }
     }
 
     // ==================== 冷启动 ====================
@@ -623,6 +651,27 @@ public class NoteService {
         fields.put("createTime", note.getCreateTime().toString());
         fields.put("likeCount", "0");
         noteRankingService.cacheNoteVO(note.getNoteId(), fields);
+    }
+
+    private void afterCommit(Runnable action) {
+        if (TransactionSynchronizationManager.isSynchronizationActive()) {
+            TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+                @Override
+                public void afterCommit() {
+                    action.run();
+                }
+            });
+        } else {
+            action.run();
+        }
+    }
+
+    private void runSafely(String actionName, Runnable action) {
+        try {
+            action.run();
+        } catch (Exception e) {
+            log.error("Feed after-commit action failed: {}", actionName, e);
+        }
     }
 
     private static long toEpochMilli(LocalDateTime dt) {

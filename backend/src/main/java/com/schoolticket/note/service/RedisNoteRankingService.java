@@ -11,6 +11,8 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.RedisCallback;
 import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.core.ZSetOperations;
+import org.springframework.data.redis.serializer.RedisSerializer;
 import org.springframework.stereotype.Service;
 
 import java.nio.charset.StandardCharsets;
@@ -38,6 +40,7 @@ public class RedisNoteRankingService {
     private static final String LIKE_COUNT_KEY = "note:like:count:%d";
     private static final String LIKE_DIRTY_KEY = "note:like:dirty";
     private static final String USER_LIKES_KEY = "user:likes:%d";
+    private static final String LOADED_KEY = "cache:loaded:%s";
     private static final int    FEED_FOLLOWING_CAP = 800;
     private static final long   VO_TTL_SECONDS = 7 * 24 * 3600;
     private static final long   LATEST_TTL_SECONDS = 86400;
@@ -105,12 +108,18 @@ public class RedisNoteRankingService {
 
     /** 发布笔记时加入 latest ZSET 和自己的 mine ZSET */
     public void addNote(Note note) {
-        long score = toEpochMilli(note.getCreateTime());
-        redis.opsForZSet().add(KEY_LATEST, String.valueOf(note.getNoteId()), score);
+        addNoteIndex(note.getNoteId(), note.getUserId(), toEpochMilli(note.getCreateTime()));
+    }
+
+    /** 写入笔记索引并统一刷新 TTL，供同步写和 MQ 修复复用。 */
+    public void addNoteIndex(Long noteId, Long userId, long score) {
+        redis.opsForZSet().add(KEY_LATEST, String.valueOf(noteId), score);
         redis.expire(KEY_LATEST, LATEST_TTL_SECONDS, TimeUnit.SECONDS);
-        String mineKey = String.format(KEY_MINE, note.getUserId());
-        redis.opsForZSet().add(mineKey, String.valueOf(note.getNoteId()), score);
+        markLoaded(KEY_LATEST, LATEST_TTL_SECONDS);
+        String mineKey = String.format(KEY_MINE, userId);
+        redis.opsForZSet().add(mineKey, String.valueOf(noteId), score);
         redis.expire(mineKey, MINE_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(mineKey, MINE_TTL_SECONDS);
     }
 
     /** 删除笔记时从所有 ZSET 移除 */
@@ -136,14 +145,22 @@ public class RedisNoteRankingService {
     /** 发布笔记时 fanout 到所有粉丝的收件箱 */
     public void fanoutToFollowers(Long authorId, Long noteId, long timestamp, Set<Long> fanIds) {
         if (fanIds == null || fanIds.isEmpty()) return;
-        String member = String.valueOf(noteId);
-        for (Long fanId : fanIds) {
-            String key = String.format(FEED_FOLLOWING_KEY, fanId);
-            redis.opsForZSet().add(key, member, timestamp);
-            // 只保留最近 N 条
-            redis.opsForZSet().removeRange(key, 0, -(FEED_FOLLOWING_CAP + 1));
-            redis.expire(key, FOLLOW_FEED_TTL_SECONDS, TimeUnit.SECONDS);
-        }
+        @SuppressWarnings("unchecked")
+        RedisSerializer<Object> valueSerializer = (RedisSerializer<Object>) redis.getValueSerializer();
+        byte[] member = valueSerializer.serialize(String.valueOf(noteId));
+        redis.executePipelined((RedisCallback<Object>) connection -> {
+            for (Long fanId : fanIds) {
+                String keyString = String.format(FEED_FOLLOWING_KEY, fanId);
+                byte[] key = keyString.getBytes(StandardCharsets.UTF_8);
+                connection.zSetCommands().zAdd(key, timestamp, member);
+                connection.zSetCommands().zRemRange(key, 0, -(FEED_FOLLOWING_CAP + 1));
+                connection.keyCommands().expire(key, FOLLOW_FEED_TTL_SECONDS);
+                byte[] loadedKey = loadedKey(keyString).getBytes(StandardCharsets.UTF_8);
+                connection.stringCommands().set(loadedKey, new byte[]{'1'});
+                connection.keyCommands().expire(loadedKey, FOLLOW_FEED_TTL_SECONDS);
+            }
+            return null;
+        });
     }
 
     /** 发布笔记时只 fanout 到最近活跃粉丝 */
@@ -206,6 +223,7 @@ public class RedisNoteRankingService {
             }
         }
         redis.expire(inboxKey, FOLLOW_FEED_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(inboxKey, FOLLOW_FEED_TTL_SECONDS);
     }
 
     /** 取关时清除该用户笔记 */
@@ -219,6 +237,7 @@ public class RedisNoteRankingService {
             redis.opsForZSet().remove(inboxKey, nid);
         }
         redis.expire(inboxKey, FOLLOW_FEED_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(inboxKey, FOLLOW_FEED_TTL_SECONDS);
     }
 
     // ==================== 作者 fanout 等级标记（middlev:ids / bigv:ids Set） ====================
@@ -318,31 +337,101 @@ public class RedisNoteRankingService {
      * 从多个中腰部/大V 的 note:mine 中拉取帖子，按时间倒序合并。
      * 对每个作者做 ZREVRANGEBYSCORE，收集 (noteId → score)，全局按 score 降序排列。
      */
-    public Map<Long, Long> pullFromBigVs(Set<Long> bigVIds, Long cursor, int pageSize) {
+    public Map<Long, Long> pullFromBigVs(Set<Long> bigVIds,
+                                         Long cursorScore,
+                                         Long cursorNoteId,
+                                         int pageSize) {
         Map<Long, Long> allEntries = new LinkedHashMap<>();
         if (bigVIds == null || bigVIds.isEmpty()) return allEntries;
 
-        long max = cursor != null ? cursor - 1 : Long.MAX_VALUE;
-
         for (Long authorId : bigVIds) {
+            ensureMineLoaded(authorId);
             String key = String.format(KEY_MINE, authorId);
-            Set<String> noteIdStrs = redis.opsForZSet().reverseRangeByScore(key, 0, max, 0, pageSize);
-            if (noteIdStrs == null) continue;
-            for (String nidStr : noteIdStrs) {
-                Long noteId = Long.valueOf(nidStr);
-                if (!allEntries.containsKey(noteId)) {
-                    Double score = redis.opsForZSet().score(key, nidStr);
-                    if (score != null) {
-                        allEntries.put(noteId, score.longValue());
-                    }
-                }
-            }
+            queryEntriesBefore(key, cursorScore, cursorNoteId, pageSize)
+                    .forEach(allEntries::putIfAbsent);
         }
 
         return allEntries.entrySet().stream()
                 .sorted(Map.Entry.<Long, Long>comparingByValue().reversed())
                 .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue,
                         (a, b) -> a, LinkedHashMap::new));
+    }
+
+    /** 读取普通作者收件箱，使用 (score,noteId) 复合游标避免同时间戳漏项。 */
+    public Map<Long, Long> getFollowingInboxEntries(Long userId,
+                                                     Long cursorScore,
+                                                     Long cursorNoteId,
+                                                     int limit) {
+        return queryEntriesBefore(String.format(FEED_FOLLOWING_KEY, userId),
+                cursorScore, cursorNoteId, limit);
+    }
+
+    private Map<Long, Long> queryEntriesBefore(String key,
+                                                Long cursorScore,
+                                                Long cursorNoteId,
+                                                int limit) {
+        if (limit <= 0) return Collections.emptyMap();
+        List<Map.Entry<Long, Long>> candidates = new ArrayList<>();
+
+        if (cursorScore != null && cursorNoteId != null) {
+            Set<ZSetOperations.TypedTuple<String>> sameScore =
+                    redis.opsForZSet().reverseRangeByScoreWithScores(key, cursorScore, cursorScore);
+            if (sameScore != null) {
+                for (ZSetOperations.TypedTuple<String> tuple : sameScore) {
+                    if (tuple.getValue() == null || tuple.getScore() == null) continue;
+                    long noteId = Long.parseLong(String.valueOf((Object) tuple.getValue()));
+                    if (noteId < cursorNoteId) {
+                        candidates.add(Map.entry(noteId, tuple.getScore().longValue()));
+                    }
+                }
+            }
+        }
+
+        if (candidates.size() < limit) {
+            double maxScore = cursorScore == null ? Double.MAX_VALUE : cursorScore - 1D;
+            candidates.addAll(fetchDescending(key, maxScore, limit - candidates.size()));
+        }
+
+        return candidates.stream()
+                .sorted(entryComparator())
+                .limit(limit)
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue,
+                        (a, b) -> a, LinkedHashMap::new));
+    }
+
+    /** 扩展边界同分组，避免 Redis ZSET 在相同 score 下截断导致复合游标漏项。 */
+    private List<Map.Entry<Long, Long>> fetchDescending(String key, double maxScore, int limit) {
+        if (limit <= 0 || maxScore < 0) return Collections.emptyList();
+        Set<ZSetOperations.TypedTuple<String>> first =
+                redis.opsForZSet().reverseRangeByScoreWithScores(key, 0, maxScore, 0, limit);
+        if (first == null || first.isEmpty()) return Collections.emptyList();
+
+        List<Map.Entry<Long, Long>> entries = tuplesToEntries(first);
+        if (entries.size() == limit) {
+            long boundaryScore = entries.stream().mapToLong(Map.Entry::getValue).min().orElse(0L);
+            Set<ZSetOperations.TypedTuple<String>> boundary =
+                    redis.opsForZSet().reverseRangeByScoreWithScores(key, boundaryScore, boundaryScore);
+            entries.removeIf(e -> e.getValue() == boundaryScore);
+            entries.addAll(tuplesToEntries(boundary));
+        }
+        return entries.stream().sorted(entryComparator()).limit(limit).collect(Collectors.toList());
+    }
+
+    private List<Map.Entry<Long, Long>> tuplesToEntries(Set<ZSetOperations.TypedTuple<String>> tuples) {
+        if (tuples == null || tuples.isEmpty()) return new ArrayList<>();
+        List<Map.Entry<Long, Long>> result = new ArrayList<>(tuples.size());
+        for (ZSetOperations.TypedTuple<String> tuple : tuples) {
+            Object value = tuple.getValue();
+            if (value != null && tuple.getScore() != null) {
+                result.add(Map.entry(Long.parseLong(String.valueOf(value)), tuple.getScore().longValue()));
+            }
+        }
+        return result;
+    }
+
+    private Comparator<Map.Entry<Long, Long>> entryComparator() {
+        return Map.Entry.<Long, Long>comparingByValue().reversed()
+                .thenComparing(Map.Entry.<Long, Long>comparingByKey().reversed());
     }
 
     // ==================== VO 缓存（note:vo:{noteId} Hash） ====================
@@ -486,12 +575,14 @@ public class RedisNoteRankingService {
         String key = String.format(USER_LIKES_KEY, userId);
         redis.opsForSet().add(key, String.valueOf(noteId));
         redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key, USER_LIKES_TTL_SECONDS);
     }
 
     public boolean addUserLikeIfAbsent(Long userId, Long noteId) {
         String key = String.format(USER_LIKES_KEY, userId);
         Long added = redis.opsForSet().add(key, String.valueOf(noteId));
         redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key, USER_LIKES_TTL_SECONDS);
         return added != null && added > 0;
     }
 
@@ -499,12 +590,14 @@ public class RedisNoteRankingService {
         String key = String.format(USER_LIKES_KEY, userId);
         redis.opsForSet().remove(key, String.valueOf(noteId));
         redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key, USER_LIKES_TTL_SECONDS);
     }
 
     public boolean removeUserLikeIfPresent(Long userId, Long noteId) {
         String key = String.format(USER_LIKES_KEY, userId);
         Long removed = redis.opsForSet().remove(key, String.valueOf(noteId));
         redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key, USER_LIKES_TTL_SECONDS);
         return removed != null && removed > 0;
     }
 
@@ -574,20 +667,21 @@ public class RedisNoteRankingService {
             redis.opsForZSet().add(KEY_LATEST, String.valueOf(note.getNoteId()), score);
         }
         redis.expire(KEY_LATEST, LATEST_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(KEY_LATEST, LATEST_TTL_SECONDS);
     }
 
     // ==================== 懒加载：按用户按需加载 ====================
 
     /** 确保 note:latest 存在，过期则从 DB 重建 */
     public void ensureLatestLoaded() {
-        if (Boolean.TRUE.equals(redis.hasKey(KEY_LATEST))) return;
+        if (isLoaded(KEY_LATEST)) return;
         syncAllFromDB();
     }
 
     /** 确保 note:mine:{userId} 存在，过期则从 DB 重建 */
     public void ensureMineLoaded(Long userId) {
         String key = String.format(KEY_MINE, userId);
-        if (Boolean.TRUE.equals(redis.hasKey(key))) return;
+        if (isLoaded(key)) return;
         List<Note> notes = noteMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<Note>()
                         .eq(Note::getUserId, userId));
@@ -596,12 +690,13 @@ public class RedisNoteRankingService {
             redis.opsForZSet().add(key, String.valueOf(note.getNoteId()), score);
         }
         redis.expire(key, MINE_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key, MINE_TTL_SECONDS);
     }
 
     /** 确保 user:likes:{userId} 存在，过期则从 DB 重建 */
     public void ensureUserLikesLoaded(Long userId) {
         String key = String.format(USER_LIKES_KEY, userId);
-        if (Boolean.TRUE.equals(redis.hasKey(key))) return;
+        if (isLoaded(key)) return;
         List<NoteLike> likes = noteLikeMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<NoteLike>()
                         .eq(NoteLike::getUserId, userId));
@@ -612,12 +707,13 @@ public class RedisNoteRankingService {
             redis.opsForSet().add(key, members);
         }
         redis.expire(key, USER_LIKES_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(key, USER_LIKES_TTL_SECONDS);
     }
 
     /** 确保 feed:following:{userId} 存在，过期则从关注列表 + 作者笔记重建收件箱 */
     public void ensureInboxLoaded(Long userId, Set<Long> followingIds) {
         String inboxKey = String.format(FEED_FOLLOWING_KEY, userId);
-        if (Boolean.TRUE.equals(redis.hasKey(inboxKey))) return;
+        if (isLoaded(inboxKey)) return;
 
         for (Long authorId : followingIds) {
             ensureMineLoaded(authorId);
@@ -633,6 +729,20 @@ public class RedisNoteRankingService {
         }
         redis.opsForZSet().removeRange(inboxKey, 0, -(FEED_FOLLOWING_CAP + 1));
         redis.expire(inboxKey, FOLLOW_FEED_TTL_SECONDS, TimeUnit.SECONDS);
+        markLoaded(inboxKey, FOLLOW_FEED_TTL_SECONDS);
+    }
+
+    private boolean isLoaded(String dataKey) {
+        return Boolean.TRUE.equals(redis.hasKey(dataKey))
+                || Boolean.TRUE.equals(redis.hasKey(loadedKey(dataKey)));
+    }
+
+    private void markLoaded(String dataKey, long ttlSeconds) {
+        redis.opsForValue().set(loadedKey(dataKey), "1", ttlSeconds, TimeUnit.SECONDS);
+    }
+
+    private static String loadedKey(String dataKey) {
+        return String.format(LOADED_KEY, dataKey);
     }
 
     // ==================== 候选池（推荐流用） ====================
@@ -674,37 +784,6 @@ public class RedisNoteRankingService {
             }
         }
         return result;
-    }
-
-    /** 读取关注流收件箱（推模式），按时间倒序游标分页 */
-    public CursorPage<Map<String, Object>> getFollowingFeedInbox(Long userId, Long cursor, int pageSize) {
-        String key = String.format(FEED_FOLLOWING_KEY, userId);
-        long total = Optional.ofNullable(redis.opsForZSet().zCard(key)).orElse(0L);
-        if (total == 0) return CursorPage.of(Collections.emptyList(), null, false, 0);
-
-        long max = cursor != null ? cursor - 1 : Long.MAX_VALUE;
-        Set<String> noteIdStrs = redis.opsForZSet().reverseRangeByScore(key, 0, max, 0, pageSize);
-        if (noteIdStrs == null || noteIdStrs.isEmpty())
-            return CursorPage.of(Collections.emptyList(), null, false, total);
-
-        List<Long> noteIds = noteIdStrs.stream().map(Long::valueOf).collect(Collectors.toList());
-
-        // 计算 lastScore 用于 nextCursor
-        double lastScore = 0;
-        for (String nid : noteIdStrs) {
-            Double s = redis.opsForZSet().score(key, nid);
-            if (s != null) lastScore = s;
-        }
-
-        boolean hasMore = noteIds.size() >= pageSize;
-        // 简单封装 noteIds，VO 组装由 NoteService.assembleNoteVOsWithRepair 完成
-        List<Map<String, Object>> records = noteIds.stream().map(nid -> {
-            Map<String, Object> m = new LinkedHashMap<>();
-            m.put("noteId", nid);
-            return m;
-        }).collect(Collectors.toList());
-
-        return CursorPage.of(records, hasMore ? String.valueOf((long) lastScore) : null, hasMore, total);
     }
 
     // ==================== 内部 ====================

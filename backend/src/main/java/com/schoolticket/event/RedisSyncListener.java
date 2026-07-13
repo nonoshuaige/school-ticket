@@ -10,11 +10,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.amqp.rabbit.annotation.RabbitListener;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.dao.DuplicateKeyException;
-import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Component;
 
 import java.util.*;
-import java.util.stream.Collectors;
 
 @Slf4j
 @Component
@@ -23,14 +21,10 @@ public class RedisSyncListener {
 
     private final RedisNoteRankingService noteRankingService;
     private final RedisFollowService followService;
-    private final StringRedisTemplate redis;
     private final NoteLikeMapper noteLikeMapper;
 
-    private static final String KEY_LATEST  = "note:latest";
-    private static final String KEY_MINE    = "note:mine:%d";
-
     /** 点赞事件 → 异步落库，Redis 已经先行返回给用户 */
-    @RabbitListener(queues = "#{noteLikeQueue.name}")
+    @RabbitListener(queues = "#{noteLikeQueue.name}", containerFactory = "feedListenerContainerFactory")
     public void handleNoteLike(Map<String, Object> msg) {
         try {
             String action = (String) msg.get("action");
@@ -70,48 +64,52 @@ public class RedisSyncListener {
     private int bigVExitThreshold;
 
     /** 创建笔记事件 → 加入 latest + mine ZSET + 推拉结合 fanout */
-    @RabbitListener(queues = "#{noteCreateQueue.name}")
+    @RabbitListener(queues = "#{noteCreateQueue.name}", containerFactory = "feedListenerContainerFactory")
     public void handleNoteCreate(Map<String, Object> msg) {
         try {
             Long noteId = ((Number) msg.get("noteId")).longValue();
             Long userId = ((Number) msg.get("userId")).longValue();
             long score  = ((Number) msg.get("createTime")).longValue();
-            boolean bigV = Boolean.TRUE.equals(msg.get("bigV"));
-            redis.opsForZSet().add(KEY_LATEST, String.valueOf(noteId), score);
-            redis.opsForZSet().add(String.format(KEY_MINE, userId), String.valueOf(noteId), score);
+            noteRankingService.addNoteIndex(noteId, userId, score);
 
-            if (bigV) {
-                noteRankingService.markBigV(userId);
-            } else {
-                @SuppressWarnings("unchecked")
-                List<String> fanIdList = (List<String>) msg.get("fanIds");
-                if (fanIdList != null && !fanIdList.isEmpty()) {
-                    Set<Long> fanIds = fanIdList.stream().map(Long::valueOf).collect(Collectors.toSet());
-                    noteRankingService.fanoutToFollowers(userId, noteId, score, fanIds);
-                }
+            RedisNoteRankingService.AuthorFanoutTier tier =
+                    resolveAuthorFanoutTier(userId, followService.getFansCount(userId));
+            if (tier == RedisNoteRankingService.AuthorFanoutTier.NORMAL) {
+                noteRankingService.fanoutToFollowers(
+                        userId, noteId, score, followService.getFanIds(userId));
+            } else if (tier == RedisNoteRankingService.AuthorFanoutTier.MIDDLE) {
+                noteRankingService.fanoutToFollowers(
+                        userId, noteId, score, noteRankingService.getActiveFanIds(userId));
             }
-            log.info("Note create synced: noteId={} userId={} bigV={}", noteId, userId, bigV);
+            log.info("Note create synced: noteId={} userId={} tier={}", noteId, userId, tier);
         } catch (Exception e) {
             log.error("handleNoteCreate error", e);
+            throw new RuntimeException(e);
         }
     }
 
     /** 删除笔记事件 → 从 latest + mine ZSET 清除 + VO 缓存 + 收件箱 */
-    @RabbitListener(queues = "#{noteDeleteQueue.name}")
+    @RabbitListener(queues = "#{noteDeleteQueue.name}", containerFactory = "feedListenerContainerFactory")
     public void handleNoteDelete(Map<String, Object> msg) {
         try {
             Long noteId = ((Number) msg.get("noteId")).longValue();
             Long userId = msg.get("userId") != null ? ((Number) msg.get("userId")).longValue() : null;
             noteRankingService.removeNoteById(noteId, userId);
             noteRankingService.deleteNoteVO(noteId);
+            noteRankingService.deleteNoteEventsCache(noteId);
+            if (userId != null) {
+                noteRankingService.removeFromFollowerInboxes(
+                        userId, noteId, followService.getFanIds(userId));
+            }
             log.info("Note delete synced to Redis: noteId={} userId={}", noteId, userId);
         } catch (Exception e) {
             log.error("handleNoteDelete error", e);
+            throw new RuntimeException(e);
         }
     }
 
     /** 关注/取关事件 → 更新 follow/fan ZSET + 收件箱回填/清理 */
-    @RabbitListener(queues = "#{followQueue.name}")
+    @RabbitListener(queues = "#{followQueue.name}", containerFactory = "feedListenerContainerFactory")
     public void handleFollow(Map<String, Object> msg) {
         try {
             String action     = (String) msg.get("action");
@@ -135,6 +133,7 @@ public class RedisSyncListener {
             log.info("Follow synced to Redis: action={} follower={} user={}", action, followerId, userId);
         } catch (Exception e) {
             log.error("handleFollow error", e);
+            throw new RuntimeException(e);
         }
     }
 
